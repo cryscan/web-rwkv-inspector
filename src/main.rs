@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{bail, Result};
 use half::f16;
@@ -67,56 +70,29 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
     })
 }
 
-#[derive(Debug, Clone)]
-enum App {
-    Start {
-        load_sender: flume::Sender<(PathBuf, flume::Sender<Result<Runtime>>)>,
-    },
-    Loading {
-        path: PathBuf,
-        runtime_receiver: flume::Receiver<Result<Runtime>>,
-        load_sender: flume::Sender<(PathBuf, flume::Sender<Result<Runtime>>)>,
-    },
-    Loaded(Runtime),
+struct App(Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>>);
+
+impl std::ops::Deref for App {
+    type Target = Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let ui = |_: &egui::Context, _: &mut eframe::Frame| {};
+        let ui: Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>> =
+            Arc::new(RwLock::new(Box::new(ui)));
+        Self(ui)
+    }
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.clone() {
-                App::Start { load_sender } => {
-                    if ui.button("Open file...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            let (runtime_sender, runtime_receiver) = flume::unbounded();
-                            let _ = load_sender.send((path.clone(), runtime_sender));
-                            *self = App::Loading {
-                                path,
-                                runtime_receiver,
-                                load_sender,
-                            };
-                        }
-                    }
-                }
-                App::Loading {
-                    path,
-                    runtime_receiver,
-                    load_sender,
-                } => {
-                    ui.label(format!("Loading model from {}...", path.to_string_lossy()));
-
-                    if let Ok(runtime) = runtime_receiver.try_recv() {
-                        match runtime {
-                            Ok(runtime) => *self = App::Loaded(runtime),
-                            Err(err) => {
-                                log::error!("{}", err);
-                                *self = App::Start { load_sender };
-                            }
-                        }
-                    }
-                }
-                App::Loaded(runtime) => {}
-            };
-        });
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let ui = self.read().unwrap();
+        ui(ctx, frame);
     }
 }
 
@@ -129,22 +105,55 @@ async fn main() {
         .init()
         .unwrap();
 
-    let (load_sender, load_receiver) = flume::unbounded();
-    let app = App::Start { load_sender };
+    let app = Box::<App>::default();
+    let ui = app.0.clone();
 
-    tokio::spawn(async move {
-        loop {
-            let Ok((path, sender)) = load_receiver.recv_async().await else {
-                continue;
+    let run = async move {
+        'main: loop {
+            // choose model file
+            let runtime = {
+                let (sender, receiver) = flume::unbounded();
+                {
+                    let mut ui = ui.write().unwrap();
+                    *ui = Box::new(move |ctx: &egui::Context, _: &mut eframe::Frame| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if ui.button("Open file...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    let _ = sender.send(path);
+                                }
+                            }
+                        });
+                    });
+                }
+
+                let Ok(path) = receiver.recv_async().await else {
+                    continue 'main;
+                };
+
+                {
+                    let path = path.clone();
+                    let mut ui = ui.write().unwrap();
+                    *ui = Box::new(move |ctx: &egui::Context, _: &mut eframe::Frame| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.label(format!("Loading model from {}...", path.to_string_lossy()));
+                        });
+                    });
+                }
+
+                let Ok(runtime) = load_runtime(path).await else {
+                    continue 'main;
+                };
+                runtime
             };
-            let runtime = load_runtime(path).await;
-            let _ = sender.send(runtime);
         }
-    });
+    };
+    tokio::spawn(run);
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("Web-RWKV Inspector", options, Box::new(|_| Box::new(app))).unwrap();
+    eframe::run_native("Web-RWKV Inspector", options, Box::new(|_| app)).unwrap();
 }
