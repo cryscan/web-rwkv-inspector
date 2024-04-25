@@ -3673,6 +3673,7 @@ dependencies = [
  "clap",
  "eframe",
  "egui",
+ "flume",
  "half",
  "image",
  "itertools",
