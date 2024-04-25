@@ -1,31 +1,49 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 use anyhow::{bail, Result};
 use half::f16;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
-use tokio::fs::File;
+use tokio::{
+    fs::File,
+    sync::watch::{Receiver, Sender},
+};
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     runtime::{
         infer::{InferInput, InferOutput},
         loader::Loader,
-        model::{
-            AsAny, Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelRuntime, ModelVersion,
-        },
+        model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
         v6, JobRuntime,
     },
+    tensor::{kind::ReadWrite, TensorGpu},
     wgpu,
 };
+
+const MAX_INPUT_LEN: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct Runtime {
     runtime: JobRuntime<InferInput, InferOutput<f16>>,
     model: v6::Model,
-    state: v6::State,
+    frame: HookFrame,
+}
+
+#[derive(Debug, Clone)]
+struct HookFrame {
+    index: Arc<AtomicUsize>,
+    layers: Vec<LayerHookFrame>,
+}
+
+#[derive(Debug, Clone)]
+struct LayerHookFrame {
+    k: TensorGpu<f32, ReadWrite>,
+    v: TensorGpu<f32, ReadWrite>,
+    r: TensorGpu<f32, ReadWrite>,
+    w: TensorGpu<f32, ReadWrite>,
 }
 
 async fn create_context(info: &ModelInfo) -> Result<Context> {
@@ -58,41 +76,104 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
     let builder = ModelBuilder::new(&context, model);
     let model = Build::<v6::Model>::build(builder).await?;
 
+    let layers = (0..model.info.num_layer)
+        .map(|_| {
+            let context = &model.context;
+            let num_emb = model.info.num_emb;
+            let num_token = MAX_INPUT_LEN;
+            let shape = [num_emb, num_token, 1, 1];
+            LayerHookFrame {
+                k: context.tensor_init(shape),
+                v: context.tensor_init(shape),
+                r: context.tensor_init(shape),
+                w: context.tensor_init(shape),
+            }
+        })
+        .collect();
+    let frame = HookFrame {
+        index: Arc::new(AtomicUsize::new(0)),
+        layers,
+    };
+
     let builder = v6::ModelJobBuilder::new(model.clone(), 1);
-    let state = builder.state();
-    let state = state.as_any().downcast_ref::<v6::State>().unwrap().clone();
     let runtime = JobRuntime::new(builder).await;
 
     Ok(Runtime {
         runtime,
         model,
-        state,
+        frame,
     })
 }
 
-struct App(Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>>);
+type BoxUi = Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>;
 
-impl std::ops::Deref for App {
-    type Target = Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>>;
+struct App(Receiver<BoxUi>);
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        let ui = |_: &egui::Context, _: &mut eframe::Frame| {};
-        let ui: Arc<RwLock<Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>>> =
-            Arc::new(RwLock::new(Box::new(ui)));
-        Self(ui)
+impl App {
+    fn new<F>(f: F) -> (Self, Sender<BoxUi>)
+    where
+        F: Fn(&egui::Context, &mut eframe::Frame) + Send + Sync + 'static,
+    {
+        let f: Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync> = Box::new(f);
+        let (sender, receiver) = tokio::sync::watch::channel(f);
+        (Self(receiver), sender)
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let ui = self.read().unwrap();
-        ui(ctx, frame);
+        let f = self.0.borrow();
+        f(ctx, frame);
+    }
+}
+
+async fn run(ui: Sender<BoxUi>) -> Result<()> {
+    'main: loop {
+        // choose model file
+        let runtime = {
+            let (tx, rx) = flume::unbounded();
+            ui.send(Box::new(move |ctx, _| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if ui.button("Open file...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            let _ = tx.send(path);
+                        }
+                    }
+                });
+            }))?;
+
+            let Ok(path) = rx.recv_async().await else {
+                continue 'main;
+            };
+
+            {
+                let path = path.clone();
+                ui.send(Box::new(move |ctx, _| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.label(format!("Loading model from {}...", path.to_string_lossy()));
+                    });
+                }))?
+            };
+
+            match load_runtime(path).await {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let (tx, rx) = flume::unbounded();
+                    ui.send(Box::new(move |ctx, _| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.heading("Error");
+                            ui.label(err.to_string());
+                            if ui.button("Ok").clicked() {
+                                let _ = tx.send(());
+                            }
+                        });
+                    }))?;
+
+                    let _ = rx.recv_async().await;
+                    continue 'main;
+                }
+            }
+        };
     }
 }
 
@@ -105,49 +186,9 @@ async fn main() {
         .init()
         .unwrap();
 
-    let app = Box::<App>::default();
-    let ui = app.0.clone();
-
-    let run = async move {
-        'main: loop {
-            // choose model file
-            let runtime = {
-                let (sender, receiver) = flume::unbounded();
-                {
-                    let mut ui = ui.write().unwrap();
-                    *ui = Box::new(move |ctx: &egui::Context, _: &mut eframe::Frame| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            if ui.button("Open file...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                    let _ = sender.send(path);
-                                }
-                            }
-                        });
-                    });
-                }
-
-                let Ok(path) = receiver.recv_async().await else {
-                    continue 'main;
-                };
-
-                {
-                    let path = path.clone();
-                    let mut ui = ui.write().unwrap();
-                    *ui = Box::new(move |ctx: &egui::Context, _: &mut eframe::Frame| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.label(format!("Loading model from {}...", path.to_string_lossy()));
-                        });
-                    });
-                }
-
-                let Ok(runtime) = load_runtime(path).await else {
-                    continue 'main;
-                };
-                runtime
-            };
-        }
-    };
-    tokio::spawn(run);
+    let (app, sender) = App::new(|_, _| {});
+    let app = Box::new(app);
+    tokio::spawn(run(sender));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
