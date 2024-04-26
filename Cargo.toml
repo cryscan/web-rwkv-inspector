@@ -11,10 +11,10 @@ bytemuck = { version = "1.13", features = ["extern_crate_alloc"] }
 clap = { version = "4.3", features = ["derive"] }
 eframe = "0.27.2"
 egui = "0.27.2"
+flume = "0.11"
 half = { version = "2.2", features = ["bytemuck", "serde"] }
 image = { version = "0.24", default-features = false, features = ["png"] }
 itertools = "0.12"
-flume = "0.11"
 log = "0.4"
 memmap2 = "0.9"
 rfd = "0.13.0"
@@ -22,6 +22,7 @@ safetensors = "0.4"
 serde = { version = "1.0", features = ["derive", "rc"] }
 simple_logger = { version = "4.2", features = ["stderr"] }
 tokio = { version = "1.37", features = ["full"] }
+uid = "0.1.7"
 
 [dependencies.web-rwkv]
 path = "../web-rwkv"

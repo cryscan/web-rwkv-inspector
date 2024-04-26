@@ -3684,6 +3684,7 @@ dependencies = [
  "serde",
  "simple_logger",
  "tokio",
+ "uid",
  "web-rwkv",
 ]
 
