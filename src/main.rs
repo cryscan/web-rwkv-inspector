@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc, Mutex, Weak},
 };
 
 use anyhow::{bail, Result};
@@ -10,7 +10,6 @@ use safetensors::SafeTensors;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
-    sync::watch::{Receiver, Sender},
 };
 use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
@@ -119,67 +118,103 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
     })
 }
 
-type ArcUi = Arc<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>;
+type BoxUi = Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>;
 
-struct App(Receiver<ArcUi>);
+struct UiHandle(Arc<()>);
+
+struct Ui(flume::Sender<(BoxUi, Weak<()>)>);
+
+impl Ui {
+    #[must_use]
+    fn create<F>(&self, ui: F) -> Result<UiHandle>
+    where
+        F: Fn(&egui::Context, &mut eframe::Frame) + Send + Sync + 'static,
+    {
+        let handle = UiHandle(Arc::new(()));
+        let weak = Arc::downgrade(&handle.0);
+        self.0.send((Box::new(ui), weak))?;
+        Ok(handle)
+    }
+}
+
+struct App {
+    rx: flume::Receiver<(BoxUi, Weak<()>)>,
+    ui: Vec<(BoxUi, Weak<()>)>,
+}
 
 impl App {
-    fn new() -> (Self, Sender<ArcUi>) {
-        let f: Arc<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync> = Arc::new(|_, _| ());
-        let (sender, receiver) = tokio::sync::watch::channel(f);
-        (Self(receiver), sender)
+    fn new() -> (Self, Ui) {
+        let (tx, rx) = flume::unbounded();
+        let ui = vec![];
+        let app = Self { rx, ui };
+        (app, Ui(tx))
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let f = self.0.borrow();
-        f(ctx, frame);
+        while let Ok(ui) = self.rx.try_recv() {
+            self.ui.push(ui);
+        }
+
+        let mut retain = vec![];
+        for ui in self.ui.drain(..) {
+            if let Some(_) = ui.1.upgrade() {
+                (ui.0)(ctx, frame);
+                retain.push(ui);
+            }
+        }
+        self.ui = retain;
     }
 }
 
-async fn run(ui: Sender<ArcUi>) -> Result<()> {
+async fn run(ui: Ui) -> Result<()> {
     let runtime = 'load: loop {
-        let (tx, rx) = flume::unbounded();
-        ui.send(Arc::new(move |ctx, _| {
-            egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
-                ui.label("Choose a model file.");
-                if ui.button("Open...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("SafeTensors", &["st"])
-                        .pick_file()
-                    {
-                        let _ = tx.send(path);
+        let path = {
+            let (tx, rx) = flume::unbounded();
+            let _ui_load = ui.create(move |ctx, _| {
+                egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
+                    ui.label("Choose a model file.");
+                    if ui.button("Open...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SafeTensors", &["st"])
+                            .pick_file()
+                        {
+                            let _ = tx.send(path);
+                        }
                     }
-                }
-            });
-        }))?;
+                });
+            })?;
 
-        let Ok(path) = rx.recv_async().await else {
-            continue 'load;
+            let Ok(path) = rx.recv_async().await else {
+                continue 'load;
+            };
+            path
         };
 
-        {
+        let ui_load = {
             let path = path.clone();
-            ui.send(Arc::new(move |ctx, _| {
+            ui.create(move |ctx, _| {
                 egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
                     ui.label(format!("Loading model from {}...", path.to_string_lossy()));
                 });
-            }))?
+            })?
         };
 
         match load_runtime(path).await {
             Ok(runtime) => break 'load runtime,
             Err(err) => {
+                drop(ui_load);
+
                 let (tx, rx) = flume::unbounded();
-                ui.send(Arc::new(move |ctx, _| {
+                let _ui_load = ui.create(move |ctx, _| {
                     egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
                         ui.label(format!("Error: {}", err));
                         if ui.button("Ok").clicked() {
                             let _ = tx.send(());
                         }
                     });
-                }))?;
+                })?;
 
                 let _ = rx.recv_async().await;
                 continue 'load;
@@ -187,9 +222,9 @@ async fn run(ui: Sender<ArcUi>) -> Result<()> {
         }
     };
 
-    let ui_info: ArcUi = {
+    let _ui_info = {
         let info = runtime.model.info.clone();
-        Arc::new(move |ctx, _| {
+        ui.create(move |ctx, _| {
             egui::Window::new("Info").show(ctx, |ui| {
                 egui::Grid::new("grid")
                     .num_columns(2)
@@ -224,17 +259,14 @@ async fn run(ui: Sender<ArcUi>) -> Result<()> {
                         ui.end_row();
                     });
             });
-        })
+        })?
     };
 
     'input: loop {
         let (tx, rx) = flume::unbounded();
         let text = Mutex::new(String::new());
 
-        let ui_info = ui_info.clone();
-        ui.send(Arc::new(move |ctx, frame| {
-            ui_info(ctx, frame);
-
+        let _ui_input = ui.create(move |ctx, _| {
             egui::Window::new("Input").show(ctx, |ui| {
                 let mut text = text.lock().unwrap();
                 let text = &mut *text;
@@ -244,7 +276,7 @@ async fn run(ui: Sender<ArcUi>) -> Result<()> {
                     let _ = tx.send(text.clone());
                 }
             });
-        }))?;
+        })?;
 
         let Ok(input) = rx.recv_async().await else {
             continue 'input;
