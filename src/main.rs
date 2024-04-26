@@ -1,10 +1,14 @@
 use std::{
     path::PathBuf,
-    sync::{atomic::AtomicUsize, Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 
 use anyhow::{bail, Result};
 use half::f16;
+use itertools::Itertools;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 use tokio::{
@@ -19,7 +23,7 @@ use web_rwkv::{
         model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
         v6, JobRuntime, Submission,
     },
-    tensor::{kind::ReadWrite, TensorGpu},
+    tensor::{kind::ReadWrite, ops::TensorOp, TensorGpu, TensorShape},
     tokenizer::Tokenizer,
     wgpu,
 };
@@ -31,17 +35,12 @@ struct Runtime {
     tokenizer: Arc<Tokenizer>,
     runtime: JobRuntime<InferInput, InferOutput<f16>>,
     model: v6::Model,
-    frame: HookFrame,
+    data: Vec<LayerHookData>,
 }
 
 #[derive(Debug, Clone)]
-struct HookFrame {
-    index: Arc<AtomicUsize>,
-    layers: Vec<LayerHookFrame>,
-}
-
-#[derive(Debug, Clone)]
-struct LayerHookFrame {
+struct LayerHookData {
+    num_token: Arc<AtomicUsize>,
     k: TensorGpu<f32, ReadWrite>,
     v: TensorGpu<f32, ReadWrite>,
     r: TensorGpu<f32, ReadWrite>,
@@ -88,33 +87,64 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
     let builder = ModelBuilder::new(&context, model);
     let model = Build::<v6::Model>::build(builder).await?;
 
-    let layers = (0..model.info.num_layer)
+    let data = (0..model.info.num_layer)
         .map(|_| {
             let context = &model.context;
             let num_emb = model.info.num_emb;
             let num_token = MAX_INPUT_TOKENS;
             let shape = [num_emb, num_token, 1, 1];
-            LayerHookFrame {
+            LayerHookData {
+                num_token: Arc::new(AtomicUsize::new(0)),
                 k: context.tensor_init(shape),
                 v: context.tensor_init(shape),
                 r: context.tensor_init(shape),
                 w: context.tensor_init(shape),
             }
         })
-        .collect();
-    let frame = HookFrame {
-        index: Arc::new(AtomicUsize::new(0)),
-        layers,
-    };
+        .collect_vec();
 
-    let builder = v6::ModelJobBuilder::new(model.clone(), 1);
+    let mut hooks: v6::HookMap<f16> = v6::HookMap::new();
+    for (n, data) in data.iter().cloned().enumerate() {
+        hooks.insert(
+            v6::Hook::PostAtt(n),
+            Box::new(move |frame: v6::Frame<f16>| {
+                let num_token = frame.buffer.att_x.shape()[1];
+
+                let start = data.num_token.fetch_add(num_token, Ordering::AcqRel);
+                let end = start + num_token;
+
+                let ops = vec![
+                    TensorOp::blit(
+                        frame.buffer.att_k.view(.., .., .., ..)?,
+                        data.k.view(.., start..end, .., ..)?,
+                    )?,
+                    TensorOp::blit(
+                        frame.buffer.att_v.view(.., .., .., ..)?,
+                        data.v.view(.., start..end, .., ..)?,
+                    )?,
+                    TensorOp::blit(
+                        frame.buffer.att_r.view(.., .., .., ..)?,
+                        data.r.view(.., start..end, .., ..)?,
+                    )?,
+                    TensorOp::blit(
+                        frame.buffer.time_decay.view(.., .., .., ..)?,
+                        data.w.view(.., start..end, .., ..)?,
+                    )?,
+                ];
+
+                Ok(TensorOp::List(ops))
+            }),
+        );
+    }
+
+    let builder = v6::ModelJobBuilder::new_with_hooks(model.clone(), 1, hooks);
     let runtime = JobRuntime::new(builder).await;
 
     Ok(Runtime {
         tokenizer,
         runtime,
         model,
-        frame,
+        data,
     })
 }
 
@@ -125,7 +155,6 @@ struct UiHandle(Arc<()>);
 struct Ui(flume::Sender<(BoxUi, Weak<()>)>);
 
 impl Ui {
-    #[must_use]
     fn create<F>(&self, ui: F) -> Result<UiHandle>
     where
         F: Fn(&egui::Context, &mut eframe::Frame) + Send + Sync + 'static,
@@ -159,7 +188,7 @@ impl eframe::App for App {
 
         let mut retain = vec![];
         for ui in self.ui.drain(..) {
-            if let Some(_) = ui.1.upgrade() {
+            if ui.1.upgrade().is_some() {
                 (ui.0)(ctx, frame);
                 retain.push(ui);
             }
@@ -197,6 +226,7 @@ async fn run(ui: Ui) -> Result<()> {
             ui.create(move |ctx, _| {
                 egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
                     ui.label(format!("Loading model from {}...", path.to_string_lossy()));
+                    ui.spinner();
                 });
             })?
         };
@@ -266,6 +296,11 @@ async fn run(ui: Ui) -> Result<()> {
         let (tx, rx) = flume::unbounded();
         let text = Mutex::new(String::new());
 
+        // reset token pointer
+        for data in runtime.data.iter() {
+            data.num_token.store(0, Ordering::Release);
+        }
+
         let _ui_input = ui.create(move |ctx, _| {
             egui::Window::new("Input").show(ctx, |ui| {
                 let mut text = text.lock().unwrap();
@@ -287,16 +322,36 @@ async fn run(ui: Ui) -> Result<()> {
         };
         tokens.truncate(MAX_INPUT_TOKENS);
 
-        let input = InferInput::new(
+        let mut inference = Some(InferInput::new(
             vec![InferInputBatch {
                 tokens,
                 option: InferOption::Full,
             }],
             128,
-        );
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let submission = Submission { input, sender };
-        runtime.runtime.send(submission).await?;
+        ));
+
+        let mut output = vec![];
+        'gen: loop {
+            let input = inference.take().unwrap();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let submission = Submission { input, sender };
+            runtime.runtime.send(submission).await?;
+
+            let (input, InferOutput(batches)) = receiver.await?;
+            if input.batches[0].tokens.is_empty() {
+                break 'gen;
+            }
+            inference = Some(input);
+
+            let batch = batches.into_iter().next().unwrap();
+            let mut x = batch
+                .0
+                .split(1)?
+                .into_iter()
+                .map(|x| x.map(|x| x.to_f32()).to_vec())
+                .collect_vec();
+            output.append(&mut x);
+        }
     }
 }
 
