@@ -521,9 +521,11 @@ async fn run(ui: Ui) -> Result<()> {
             let kv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
             let rkv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
             let token = Mutex::new(select);
+            let scale = Mutex::new(0);
             let show_rkv = Mutex::new(false);
             let _inspect_ui = ui.create(move |ctx, _| {
                 let mut token = token.lock().unwrap();
+                let mut scale = scale.lock().unwrap();
                 let mut show_rkv = show_rkv.lock().unwrap();
 
                 let size = info.num_emb / info.num_head;
@@ -536,9 +538,12 @@ async fn run(ui: Ui) -> Result<()> {
                     ui.separator();
                     ui.checkbox(&mut show_rkv, "Show R-Queried W-decayed KV");
 
-                    // let slider: egui::Slider<'_> =
-                    //     egui::Slider::new(&mut *scale, -12..=0).text("Scale");
-                    // ui.add(slider);
+                    let slider: egui::Slider<'_> =
+                        egui::Slider::new(&mut *scale, -6..=0).text("Scale");
+                    if ui.add(slider).changed() {
+                        kv_textures.lock().unwrap().clear();
+                        rkv_textures.lock().unwrap().clear();
+                    }
 
                     let slider =
                         egui::Slider::new(&mut *token, select..=num_token - 1).text("Token");
@@ -559,7 +564,7 @@ async fn run(ui: Ui) -> Result<()> {
 
                                 for head in 0..info.num_head {
                                     let token = *token;
-                                    let scale = 1.0;
+                                    let scale = 10.0_f32.powi(*scale);
                                     let key = HeadKey { layer, head, token };
                                     let mut image = egui::epaint::ColorImage::new(
                                         [size, size],
@@ -569,15 +574,13 @@ async fn run(ui: Ui) -> Result<()> {
                                         true => rkv.get(&key),
                                         false => kv.get(&key),
                                     } {
-                                        let norm = kv
-                                            .iter()
-                                            .map(|x| x * scale)
-                                            .map(|x| x.clamp(-1.0, 1.0));
-                                        for (pixel, norm) in image.pixels.iter_mut().zip_eq(norm) {
-                                            if norm >= 0.0 {
-                                                pixel[0] = (norm * 255.0) as u8;
+                                        for (pixel, kv) in image.pixels.iter_mut().zip_eq(kv.iter())
+                                        {
+                                            let kv = (kv * scale).clamp(-1.0, 1.0);
+                                            if kv >= 0.0 {
+                                                pixel[0] = (kv * 255.0) as u8;
                                             } else {
-                                                pixel[1] = (-norm * 255.0) as u8;
+                                                pixel[1] = (-kv * 255.0) as u8;
                                             }
                                         }
                                     }
