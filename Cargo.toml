@@ -26,4 +26,5 @@ tokio = { version = "1.37", features = ["full"] }
 uid = "0.1.7"
 
 [dependencies.web-rwkv]
-path = "../web-rwkv"
+# path = "../web-rwkv"
+version = "0.7.6"
