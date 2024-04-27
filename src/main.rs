@@ -148,7 +148,7 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
     }
 
     let builder = v6::ModelJobBuilder::new_with_hooks(model.clone(), 1, hooks);
-    let runtime: JobRuntime<InferInput, InferOutput<f16>> = JobRuntime::new(builder).await;
+    let runtime = JobRuntime::new(builder).await;
 
     Ok(Runtime {
         tokenizer,
