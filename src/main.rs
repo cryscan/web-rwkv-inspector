@@ -359,15 +359,17 @@ async fn run(ui: Ui) -> Result<()> {
             128,
         ));
 
-        let mut x = vec![];
         let mut data = vec![HookDataCpu::default(); runtime.model.info.num_layer];
         'prefill: loop {
             let input = inference.take().unwrap();
+            let pre_num_token = input.batches[0].tokens.len();
+
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let submission = Submission { input, sender };
             let _ = runtime.runtime.send(submission).await;
 
             let (input, InferOutput(batches)) = receiver.await?;
+            let post_num_token = input.batches[0].tokens.len();
             inference = Some(input);
 
             fn split<F: Float>(x: TensorCpu<F>) -> Vec<Vec<f32>> {
@@ -378,14 +380,18 @@ async fn run(ui: Ui) -> Result<()> {
                     .collect()
             }
 
-            let batch = batches.into_iter().next().unwrap();
-            x.append(&mut split(batch.0));
+            let _batch = batches.into_iter().next().unwrap();
+            let num_token = pre_num_token - post_num_token;
 
             for (cpu, gpu) in data.iter_mut().zip_eq(runtime.data.iter()) {
                 let mut k = split(gpu.k.back().await);
                 let mut v = split(gpu.v.back().await);
                 let mut r = split(gpu.r.back().await);
                 let mut w = split(gpu.w.back().await);
+                k.truncate(num_token);
+                v.truncate(num_token);
+                r.truncate(num_token);
+                w.truncate(num_token);
                 cpu.k.append(&mut k);
                 cpu.v.append(&mut v);
                 cpu.r.append(&mut r);
@@ -471,23 +477,17 @@ async fn run(ui: Ui) -> Result<()> {
 
                 for (layer, data) in data.into_iter().enumerate() {
                     for head in 0..info.num_head {
+                        let token = select;
                         let start = size * head;
                         let end = start + size;
-                        let k = &data.k[select][start..end];
-                        let v = &data.v[select][start..end];
+                        let k = &data.k[token][start..end];
+                        let v = &data.v[token][start..end];
                         let mut tensor = Vec::with_capacity(size * size);
                         for (v, k) in v.iter().cartesian_product(k.iter()) {
                             tensor.push(k * v);
                         }
-                        kv.insert(
-                            HeadKey {
-                                layer,
-                                head,
-                                token: select,
-                            },
-                            tensor.clone(),
-                        );
-                        for token in (select + 1)..num_token {
+                        kv.insert(HeadKey { layer, head, token }, tensor.clone());
+                        for token in (token + 1)..num_token {
                             let w = &data.w[token][start..end];
                             let r = &data.r[token][start..end];
                             for (j, i) in (0..size).cartesian_product(0..size) {
@@ -519,11 +519,13 @@ async fn run(ui: Ui) -> Result<()> {
             let decoded = decoded.clone();
             let (tx, rx) = flume::unbounded();
             let kv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
+            let rkv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
             let token = Mutex::new(select);
-            let scale = Mutex::new(0);
+            let show_rkv = Mutex::new(false);
             let _inspect_ui = ui.create(move |ctx, _| {
                 let mut token = token.lock().unwrap();
-                let mut scale = scale.lock().unwrap();
+                let mut show_rkv = show_rkv.lock().unwrap();
+
                 let size = info.num_emb / info.num_head;
 
                 egui::Window::new("Inspect").show(ctx, |ui| {
@@ -532,9 +534,11 @@ async fn run(ui: Ui) -> Result<()> {
                     }
 
                     ui.separator();
-                    let slider: egui::Slider<'_> =
-                        egui::Slider::new(&mut *scale, -6..=6).text("Scale");
-                    ui.add(slider);
+                    ui.checkbox(&mut show_rkv, "Show R-Queried W-decayed KV");
+
+                    // let slider: egui::Slider<'_> =
+                    //     egui::Slider::new(&mut *scale, -12..=0).text("Scale");
+                    // ui.add(slider);
 
                     let slider =
                         egui::Slider::new(&mut *token, select..=num_token - 1).text("Token");
@@ -555,33 +559,32 @@ async fn run(ui: Ui) -> Result<()> {
 
                                 for head in 0..info.num_head {
                                     let token = *token;
-                                    let scale = 10.0_f32.powi(*scale);
+                                    let scale = 1.0;
                                     let key = HeadKey { layer, head, token };
                                     let mut image = egui::epaint::ColorImage::new(
                                         [size, size],
                                         egui::Color32::BLACK,
                                     );
-                                    if let Some(kv) = kv.get(&key) {
+                                    if let Some(kv) = match *show_rkv {
+                                        true => rkv.get(&key),
+                                        false => kv.get(&key),
+                                    } {
                                         let norm = kv
                                             .iter()
                                             .map(|x| x * scale)
-                                            .map(|x| x.clamp(-1.0, 1.0) * 0.5 + 0.5)
-                                            .map(|x| (x * 255.0) as u8);
-                                        image.pixels = norm
-                                            .map(|x| egui::Color32::from_rgb(x, 0, 0))
-                                            .collect();
-                                    }
-                                    if let Some(rkv) = rkv.get(&key) {
-                                        let norm = rkv
-                                            .iter()
-                                            .map(|x| x * scale)
-                                            .map(|x| x.clamp(-1.0, 1.0) * 0.5 + 0.5)
-                                            .map(|x| (x * 255.0) as u8);
+                                            .map(|x| x.clamp(-1.0, 1.0));
                                         for (pixel, norm) in image.pixels.iter_mut().zip_eq(norm) {
-                                            *pixel = egui::Color32::from_rgb(pixel.r(), norm, 127);
+                                            if norm >= 0.0 {
+                                                pixel[0] = (norm * 255.0) as u8;
+                                            } else {
+                                                pixel[1] = (-norm * 255.0) as u8;
+                                            }
                                         }
                                     }
-                                    let mut textures = kv_textures.lock().unwrap();
+                                    let mut textures = match *show_rkv {
+                                        true => rkv_textures.lock().unwrap(),
+                                        false => kv_textures.lock().unwrap(),
+                                    };
                                     let texture = match textures.get(&key) {
                                         Some(texture) => texture.clone(),
                                         None => {
