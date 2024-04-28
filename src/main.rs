@@ -572,7 +572,7 @@ async fn run(ui: Ui) -> Result<()> {
                     ui.separator();
                     egui::ScrollArea::both().show(ui, |ui| {
                         egui::Grid::new("image").spacing([4.0, 4.0]).show(ui, |ui| {
-                            // ui.label("L\\H");
+                            ui.label("L\\H");
                             for head in 0..info.num_head {
                                 ui.label(format!("{head}"));
                             }
