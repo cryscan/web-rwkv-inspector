@@ -507,14 +507,11 @@ async fn run(ui: Ui) -> Result<()> {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for (index, word) in decoded.iter().enumerate() {
-                                match index.cmp(&source) {
-                                    Ordering::Less => {
-                                        ui.label(word);
-                                    }
+                                let text = match index.cmp(&source) {
+                                    Ordering::Less => egui::RichText::new(word),
                                     Ordering::Equal => {
-                                        let text = egui::RichText::new(word)
-                                            .color(egui::Color32::LIGHT_BLUE);
-                                        ui.label(text);
+                                        let color = egui::Color32::LIGHT_BLUE;
+                                        egui::RichText::new(word).color(color)
                                     }
                                     Ordering::Greater => {
                                         let layer = *layer;
@@ -536,10 +533,15 @@ async fn run(ui: Ui) -> Result<()> {
                                             } else {
                                                 egui::Color32::LIGHT_GREEN.gamma_multiply(-rk)
                                             };
-                                            let text = egui::RichText::new(word).color(color);
-                                            ui.label(text);
+                                            egui::RichText::new(word).color(color)
+                                        } else {
+                                            egui::RichText::new(word)
                                         }
                                     }
+                                };
+                                let label = egui::Label::new(text).sense(egui::Sense::click());
+                                if ui.add(label).clicked() {
+                                    *source = index;
                                 }
                             }
                         });
