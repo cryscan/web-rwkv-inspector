@@ -6,7 +6,7 @@ on:
 name: Release
 
 env:
-  RELEASE_BIN: ai00_server
+  RELEASE_BIN: web-rwkv-inspector
   RELEASE_DIR: artifacts
   GITHUB_REF: '${{ github.ref }}'
   WINDOWS_TARGET: x86_64-pc-windows-msvc
@@ -140,7 +140,7 @@ jobs:
       #   with:
       #     name: linux
 
-      - name: Download MacOS tarball
+      - name: Download Windows tarball
         uses: actions/download-artifact@v1
         with:
           name: windows
