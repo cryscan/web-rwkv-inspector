@@ -10,7 +10,6 @@ use half::f16;
 use itertools::Itertools;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
-use serde::{Deserialize, Serialize};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
@@ -60,6 +59,7 @@ struct HookDataCpu {
 struct HeadKey {
     layer: usize,
     head: usize,
+    source: usize,
     token: usize,
 }
 
@@ -410,281 +410,151 @@ async fn run(ui: Ui) -> Result<()> {
         }
         drop(ui_input);
 
-        loop {
-            let select = {
-                enum TokenSelection {
-                    Back,
-                    Token(usize),
-                    Select,
-                }
-
-                let decoded = decoded.clone();
-                let (tx, rx) = flume::unbounded();
-                let (select_tx, select_rx) = tokio::sync::watch::channel(usize::MAX);
-                let _ui_input = ui.create(move |ctx, _| {
-                    egui::Window::new("Tokens")
-                        .max_height(400.0)
-                        .show(ctx, |ui| {
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    for (index, token) in decoded.iter().enumerate() {
-                                        let button = if index == *select_rx.borrow() {
-                                            let token = token.replace('\n', "↩");
-                                            ui.small_button(
-                                                egui::RichText::new(token)
-                                                    .color(egui::Color32::LIGHT_RED),
-                                            )
-                                        } else {
-                                            let token = token.replace('\n', "↩");
-                                            ui.small_button(token)
-                                        };
-                                        if button.clicked() {
-                                            let _ = tx.send(TokenSelection::Token(index));
-                                        }
-                                        if token.contains('\n') {
-                                            ui.end_row();
-                                        }
-                                    }
-                                });
-                            });
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui.button("Back").clicked() {
-                                    let _ = tx.send(TokenSelection::Back);
-                                }
-                                if *select_rx.borrow() != usize::MAX
-                                    && ui.button("Select").clicked()
-                                {
-                                    let _ = tx.send(TokenSelection::Select);
-                                }
-                            });
-                        });
-                });
-
-                'select: loop {
-                    match rx.recv_async().await? {
-                        TokenSelection::Back => continue 'input,
-                        TokenSelection::Token(index) => select_tx.send(index)?,
-                        TokenSelection::Select => break 'select *select_tx.borrow(),
-                    }
-                }
-            };
-
-            let data = data.clone();
+        let rk = {
             let info = runtime.model.info.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                let size = info.num_emb / info.num_head;
-                let mut kv = HashMap::new();
-                let mut rkv = HashMap::new();
-                let mut rk = HashMap::new();
+            let data = Arc::new(data);
+            let mut rk = HashMap::new();
 
-                for (layer, data) in data.into_iter().enumerate() {
+            let size = info.num_emb / info.num_head;
+            let (tx, rx) = flume::unbounded();
+            let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1) / 2;
+
+            for layer in 0..info.num_layer {
+                let info = runtime.model.info.clone();
+                let data = data.clone();
+                let tx = tx.clone();
+
+                tokio::task::spawn_blocking(move || {
                     for head in 0..info.num_head {
-                        let token = select;
                         let start = size * head;
                         let end = start + size;
-                        let k = &data.k[token][start..end];
-                        let v = &data.v[token][start..end];
-                        let mut tensor = Vec::with_capacity(size * size);
-                        for (v, k) in v.iter().cartesian_product(k.iter()) {
-                            tensor.push(k * v);
-                        }
-                        let mut k = k.to_vec();
-                        kv.insert(HeadKey { layer, head, token }, tensor.clone());
-                        for token in (token + 1)..num_token {
-                            let key = HeadKey { layer, head, token };
 
-                            let w = &data.w[token][start..end];
-                            let r = &data.r[token][start..end];
-                            for (j, i) in (0..size).cartesian_product(0..size) {
-                                tensor[j * size + i] *= w[i];
-                            }
-                            kv.insert(key, tensor.clone());
+                        for source in 0..num_token {
+                            let mut k = data[layer].k[source][start..end].to_vec();
 
-                            let mut tensor = tensor.clone();
-                            for (j, i) in (0..size).cartesian_product(0..size) {
-                                tensor[j * size + i] *= r[i];
-                            }
-                            rkv.insert(key, tensor);
+                            for token in source + 1..num_token {
+                                let w = &data[layer].w[token][start..end];
+                                let r = &data[layer].r[token][start..end];
+                                for (k, w) in k.iter_mut().zip_eq(w) {
+                                    *k *= w;
+                                }
 
-                            let mut score = 0.0;
-                            for i in 0..size {
-                                k[i] *= w[i];
-                                score += k[i] * r[i];
+                                let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
+                                let key = HeadKey {
+                                    layer,
+                                    head,
+                                    source,
+                                    token,
+                                };
+
+                                let Ok(_) = tx.send((key, dot)) else {
+                                    return;
+                                };
                             }
-                            rk.insert(key, score);
                         }
                     }
-                }
-
-                (kv, rkv, rk)
-            });
-
-            let (kv, rkv, rk) = {
-                let _inspect_ui = ui.create(|ctx, _| {
-                    egui::Window::new("Inspect").show(ctx, |ui| {
-                        ui.spinner();
-                    });
                 });
-                handle.await?
-            };
-
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-            enum Mode {
-                Kv,
-                Rkv,
-                Rk,
             }
 
-            let decoded = decoded.clone();
-            let (tx, rx) = flume::unbounded();
-            let textures = Mutex::new(HashMap::<(Mode, HeadKey), egui::TextureHandle>::new());
-            let mode = Mutex::new(Mode::Kv);
-            let token = Mutex::new(select);
-            let scale = Mutex::new(0);
-
-            let layer = Mutex::new(0);
-            let head = Mutex::new(0);
-
-            let _inspect_ui = ui.create(move |ctx, _| {
-                let mut textures = textures.lock().unwrap();
-                let mut mode = mode.lock().unwrap();
-                let mut token = token.lock().unwrap();
-                let mut scale = scale.lock().unwrap();
-
-                egui::Window::new("Inspect").show(ctx, |ui| {
-                    if ui.button("Back").clicked() {
-                        let _ = tx.send(());
-                    }
-
-                    ui.separator();
+            let (processed_tx, processed_rx) = tokio::sync::watch::channel(0usize);
+            let _process_ui = ui.create(move |ctx, _| {
+                egui::Window::new("Inspector").show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut *mode, Mode::Kv, "KV");
-                        ui.radio_value(&mut *mode, Mode::Rkv, "RKV");
-                        ui.radio_value(&mut *mode, Mode::Rk, "RK");
+                        ui.label("Processing tokens...");
+                        ui.spinner();
                     });
 
-                    if ui
-                        .add(egui::Slider::new(&mut *scale, -6..=0).text("Scale"))
-                        .changed()
-                    {
-                        textures.clear();
-                    }
-
-                    ui.add(egui::Slider::new(&mut *token, select..=num_token - 1).text("Token"));
-                    ui.label(decoded[*token].replace('\n', "↩"));
-
-                    ui.separator();
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        egui::Grid::new("image").spacing([4.0, 4.0]).show(ui, |ui| {
-                            ui.label("L\\H");
-                            for head in 0..info.num_head {
-                                ui.label(format!("{head}"));
-                            }
-                            ui.end_row();
-
-                            for layer in 0..info.num_layer {
-                                ui.label(format!("{layer}"));
-
-                                for head in 0..info.num_head {
-                                    let mode = *mode;
-                                    let token = *token;
-                                    let scale = 10.0_f32.powi(*scale);
-
-                                    // let size = match mode {
-                                    //     Mode::Kv => info.num_emb / info.num_head,
-                                    //     Mode::Rkv => info.num_emb / info.num_head,
-                                    //     Mode::Rk => 8,
-                                    // };
-                                    let size = info.num_emb / info.num_head;
-
-                                    let key = HeadKey { layer, head, token };
-                                    let mut image = egui::epaint::ColorImage::new(
-                                        [size, size],
-                                        egui::Color32::BLACK,
-                                    );
-                                    if let Some(x) = match mode {
-                                        Mode::Rkv => rkv.get(&key).cloned(),
-                                        Mode::Kv => kv.get(&key).cloned(),
-                                        Mode::Rk => rk.get(&key).map(|&x| vec![x; size * size]),
-                                    } {
-                                        for (pixel, x) in image.pixels.iter_mut().zip_eq(x.iter()) {
-                                            let x = (x * scale).clamp(-1.0, 1.0);
-                                            if x >= 0.0 {
-                                                pixel[0] = (x * 255.0) as u8;
-                                            } else {
-                                                pixel[1] = (-x * 255.0) as u8;
-                                            }
-                                        }
-                                    }
-                                    let texture = match textures.get(&(mode, key)) {
-                                        Some(texture) => texture.clone(),
-                                        None => {
-                                            let texture = ctx.load_texture(
-                                                format!("{:?}_{:?}", mode, key),
-                                                image,
-                                                Default::default(),
-                                            );
-                                            textures.insert((mode, key), texture.clone());
-                                            texture
-                                        }
-                                    };
-                                    ui.image((texture.id(), texture.size_vec2()))
-                                        .on_hover_text(format!("L{}, H{}", layer, head));
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    });
+                    let progress = *processed_rx.borrow() as f32 / total_rk as f32;
+                    ui.add(egui::ProgressBar::new(progress));
                 });
+            });
 
-                let mut layer = layer.lock().unwrap();
-                let mut head = head.lock().unwrap();
+            while *processed_tx.borrow() < total_rk {
+                let (key, value) = rx.recv_async().await?;
+                rk.insert(key, value);
+                processed_tx.send_modify(|count| *count += 1);
+            }
 
-                egui::Window::new("Tracer").show(ctx, |ui| {
+            rk
+        };
+
+        {
+            enum InspectorEvent {
+                Back,
+            }
+
+            let info = runtime.model.info.clone();
+            let decoded = decoded.clone();
+            let scale = Mutex::new(0);
+            let source = Mutex::new(0usize);
+            let layer = Mutex::new(0usize);
+            let head = Mutex::new(0usize);
+
+            let (tx, rx) = flume::unbounded();
+            let _inspect_ui = ui.create(move |ctx, _| {
+                egui::Window::new("Inspector").show(ctx, |ui| {
+                    let mut scale = scale.lock().unwrap();
+                    let mut source = source.lock().unwrap();
+                    let mut layer = layer.lock().unwrap();
+                    let mut head = head.lock().unwrap();
+
+                    ui.add(egui::Slider::new(&mut *scale, -3..=0).text("Scale"));
+                    ui.add(egui::Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
                     ui.add(egui::Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
                     ui.add(egui::Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
-
                     ui.separator();
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for (index, word) in decoded.iter().enumerate() {
-                                match index.cmp(&select) {
+                                match index.cmp(&source) {
                                     Ordering::Less => {
-                                        ui.label(egui::RichText::new(word));
+                                        ui.label(word);
                                     }
                                     Ordering::Equal => {
-                                        ui.label(
-                                            egui::RichText::new(word)
-                                                .color(egui::Color32::LIGHT_BLUE),
-                                        );
+                                        let text = egui::RichText::new(word)
+                                            .color(egui::Color32::LIGHT_BLUE);
+                                        ui.label(text);
                                     }
                                     Ordering::Greater => {
                                         let layer = *layer;
                                         let head = *head;
+                                        let source = *source;
                                         let token = index;
                                         let scale = 10.0_f32.powi(*scale);
 
-                                        let key = HeadKey { layer, head, token };
-                                        let x = rk.get(&key).copied().unwrap_or_default();
-                                        let x = (x * scale).clamp(-1.0, 1.0);
-                                        let mut color = egui::Color32::BLACK;
-                                        if x >= 0.0 {
-                                            color[0] = (x * 255.0) as u8;
-                                        } else {
-                                            color[1] = (-x * 255.0) as u8;
+                                        let key = HeadKey {
+                                            layer,
+                                            head,
+                                            source,
+                                            token,
+                                        };
+                                        if let Some(rk) = rk.get(&key) {
+                                            let rk = (rk * scale).clamp(-1.0, 1.0);
+                                            let color = if rk >= 0.0 {
+                                                egui::Color32::LIGHT_RED.gamma_multiply(rk)
+                                            } else {
+                                                egui::Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                            };
+                                            let text = egui::RichText::new(word).color(color);
+                                            ui.label(text);
                                         }
-
-                                        ui.label(egui::RichText::new(word).color(color));
                                     }
                                 }
                             }
-                        })
+                        });
                     });
+
+                    ui.separator();
+                    if ui.button("Back").clicked() {
+                        let _ = tx.send(InspectorEvent::Back);
+                    }
                 });
             });
-            rx.recv_async().await?;
+
+            match rx.recv_async().await? {
+                InspectorEvent::Back => continue 'input,
+            }
         }
     }
 }

@@ -17,7 +17,7 @@ image = { version = "0.24", default-features = false, features = ["png"] }
 itertools = "0.12"
 log = "0.4"
 memmap2 = "0.9"
-ndarray = "0.15.6"
+rayon = "1.10.0"
 rfd = "0.13.0"
 safetensors = "0.4"
 serde = { version = "1.0", features = ["derive", "rc"] }
