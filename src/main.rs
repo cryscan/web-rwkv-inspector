@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
@@ -542,7 +543,11 @@ async fn run(ui: Ui) -> Result<()> {
             let token = Mutex::new(select);
             let scale = Mutex::new(0);
 
+            let layer = Mutex::new(0);
+            let head = Mutex::new(0);
+
             let _inspect_ui = ui.create(move |ctx, _| {
+                let mut textures = textures.lock().unwrap();
                 let mut mode = mode.lock().unwrap();
                 let mut token = token.lock().unwrap();
                 let mut scale = scale.lock().unwrap();
@@ -563,7 +568,7 @@ async fn run(ui: Ui) -> Result<()> {
                         .add(egui::Slider::new(&mut *scale, -6..=0).text("Scale"))
                         .changed()
                     {
-                        textures.lock().unwrap().clear();
+                        textures.clear();
                     }
 
                     ui.add(egui::Slider::new(&mut *token, select..=num_token - 1).text("Token"));
@@ -586,33 +591,32 @@ async fn run(ui: Ui) -> Result<()> {
                                     let token = *token;
                                     let scale = 10.0_f32.powi(*scale);
 
-                                    let size = match mode {
-                                        Mode::Kv => info.num_emb / info.num_head,
-                                        Mode::Rkv => info.num_emb / info.num_head,
-                                        Mode::Rk => 8,
-                                    };
+                                    // let size = match mode {
+                                    //     Mode::Kv => info.num_emb / info.num_head,
+                                    //     Mode::Rkv => info.num_emb / info.num_head,
+                                    //     Mode::Rk => 8,
+                                    // };
+                                    let size = info.num_emb / info.num_head;
 
                                     let key = HeadKey { layer, head, token };
                                     let mut image = egui::epaint::ColorImage::new(
                                         [size, size],
                                         egui::Color32::BLACK,
                                     );
-                                    if let Some(kv) = match mode {
+                                    if let Some(x) = match mode {
                                         Mode::Rkv => rkv.get(&key).cloned(),
                                         Mode::Kv => kv.get(&key).cloned(),
                                         Mode::Rk => rk.get(&key).map(|&x| vec![x; size * size]),
                                     } {
-                                        for (pixel, kv) in image.pixels.iter_mut().zip_eq(kv.iter())
-                                        {
-                                            let kv = (kv * scale).clamp(-1.0, 1.0);
-                                            if kv >= 0.0 {
-                                                pixel[0] = (kv * 255.0) as u8;
+                                        for (pixel, x) in image.pixels.iter_mut().zip_eq(x.iter()) {
+                                            let x = (x * scale).clamp(-1.0, 1.0);
+                                            if x >= 0.0 {
+                                                pixel[0] = (x * 255.0) as u8;
                                             } else {
-                                                pixel[1] = (-kv * 255.0) as u8;
+                                                pixel[1] = (-x * 255.0) as u8;
                                             }
                                         }
                                     }
-                                    let mut textures = textures.lock().unwrap();
                                     let texture = match textures.get(&(mode, key)) {
                                         Some(texture) => texture.clone(),
                                         None => {
@@ -625,11 +629,58 @@ async fn run(ui: Ui) -> Result<()> {
                                             texture
                                         }
                                     };
-                                    ui.image((texture.id(), texture.size_vec2()));
+                                    ui.image((texture.id(), texture.size_vec2()))
+                                        .on_hover_text(format!("L{}, H{}", layer, head));
                                 }
                                 ui.end_row();
                             }
                         });
+                    });
+                });
+
+                let mut layer = layer.lock().unwrap();
+                let mut head = head.lock().unwrap();
+
+                egui::Window::new("Tracer").show(ctx, |ui| {
+                    ui.add(egui::Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
+                    ui.add(egui::Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
+
+                    ui.separator();
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (index, word) in decoded.iter().enumerate() {
+                                match index.cmp(&select) {
+                                    Ordering::Less => {
+                                        ui.label(egui::RichText::new(word));
+                                    }
+                                    Ordering::Equal => {
+                                        ui.label(
+                                            egui::RichText::new(word)
+                                                .color(egui::Color32::LIGHT_BLUE),
+                                        );
+                                    }
+                                    Ordering::Greater => {
+                                        let layer = *layer;
+                                        let head = *head;
+                                        let token = index;
+                                        let scale = 10.0_f32.powi(*scale);
+
+                                        let key = HeadKey { layer, head, token };
+                                        let x = rk.get(&key).copied().unwrap_or_default();
+                                        let x = (x * scale).clamp(-1.0, 1.0);
+                                        let mut color = egui::Color32::BLACK;
+                                        if x >= 0.0 {
+                                            color[0] = (x * 255.0) as u8;
+                                        } else {
+                                            color[1] = (-x * 255.0) as u8;
+                                        }
+
+                                        ui.label(egui::RichText::new(word).color(color));
+                                    }
+                                }
+                            }
+                        })
                     });
                 });
             });
