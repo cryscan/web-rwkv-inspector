@@ -9,6 +9,7 @@ use half::f16;
 use itertools::Itertools;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
@@ -474,6 +475,7 @@ async fn run(ui: Ui) -> Result<()> {
                 let size = info.num_emb / info.num_head;
                 let mut kv = HashMap::new();
                 let mut rkv = HashMap::new();
+                let mut rk = HashMap::new();
 
                 for (layer, data) in data.into_iter().enumerate() {
                     for head in 0..info.num_head {
@@ -486,28 +488,38 @@ async fn run(ui: Ui) -> Result<()> {
                         for (v, k) in v.iter().cartesian_product(k.iter()) {
                             tensor.push(k * v);
                         }
+                        let mut k = k.to_vec();
                         kv.insert(HeadKey { layer, head, token }, tensor.clone());
                         for token in (token + 1)..num_token {
+                            let key = HeadKey { layer, head, token };
+
                             let w = &data.w[token][start..end];
                             let r = &data.r[token][start..end];
                             for (j, i) in (0..size).cartesian_product(0..size) {
                                 tensor[j * size + i] *= w[i];
                             }
-                            kv.insert(HeadKey { layer, head, token }, tensor.clone());
+                            kv.insert(key, tensor.clone());
 
                             let mut tensor = tensor.clone();
                             for (j, i) in (0..size).cartesian_product(0..size) {
                                 tensor[j * size + i] *= r[i];
                             }
-                            rkv.insert(HeadKey { layer, head, token }, tensor);
+                            rkv.insert(key, tensor);
+
+                            let mut score = 0.0;
+                            for i in 0..size {
+                                k[i] *= w[i];
+                                score += k[i] * r[i];
+                            }
+                            rk.insert(key, score);
                         }
                     }
                 }
 
-                (kv, rkv)
+                (kv, rkv, rk)
             });
 
-            let (kv, rkv) = {
+            let (kv, rkv, rk) = {
                 let _inspect_ui = ui.create(|ctx, _| {
                     egui::Window::new("Inspect").show(ctx, |ui| {
                         ui.spinner();
@@ -516,19 +528,24 @@ async fn run(ui: Ui) -> Result<()> {
                 handle.await?
             };
 
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+            enum Mode {
+                Kv,
+                Rkv,
+                Rk,
+            }
+
             let decoded = decoded.clone();
             let (tx, rx) = flume::unbounded();
-            let kv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
-            let rkv_textures = Mutex::new(HashMap::<HeadKey, egui::TextureHandle>::new());
+            let textures = Mutex::new(HashMap::<(Mode, HeadKey), egui::TextureHandle>::new());
+            let mode = Mutex::new(Mode::Kv);
             let token = Mutex::new(select);
             let scale = Mutex::new(0);
-            let show_rkv = Mutex::new(false);
+
             let _inspect_ui = ui.create(move |ctx, _| {
+                let mut mode = mode.lock().unwrap();
                 let mut token = token.lock().unwrap();
                 let mut scale = scale.lock().unwrap();
-                let mut show_rkv = show_rkv.lock().unwrap();
-
-                let size = info.num_emb / info.num_head;
 
                 egui::Window::new("Inspect").show(ctx, |ui| {
                     if ui.button("Back").clicked() {
@@ -536,43 +553,54 @@ async fn run(ui: Ui) -> Result<()> {
                     }
 
                     ui.separator();
-                    ui.checkbox(&mut show_rkv, "Show R-Queried W-decayed KV");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut *mode, Mode::Kv, "KV");
+                        ui.radio_value(&mut *mode, Mode::Rkv, "RKV");
+                        ui.radio_value(&mut *mode, Mode::Rk, "RK");
+                    });
 
-                    let slider: egui::Slider<'_> =
-                        egui::Slider::new(&mut *scale, -6..=0).text("Scale");
-                    if ui.add(slider).changed() {
-                        kv_textures.lock().unwrap().clear();
-                        rkv_textures.lock().unwrap().clear();
+                    if ui
+                        .add(egui::Slider::new(&mut *scale, -6..=0).text("Scale"))
+                        .changed()
+                    {
+                        textures.lock().unwrap().clear();
                     }
 
-                    let slider =
-                        egui::Slider::new(&mut *token, select..=num_token - 1).text("Token");
-                    ui.add(slider);
+                    ui.add(egui::Slider::new(&mut *token, select..=num_token - 1).text("Token"));
                     ui.label(decoded[*token].replace('\n', "↩"));
 
                     ui.separator();
                     egui::ScrollArea::both().show(ui, |ui| {
-                        egui::Grid::new("image").spacing([8.0, 4.0]).show(ui, |ui| {
-                            ui.label("");
+                        egui::Grid::new("image").spacing([4.0, 4.0]).show(ui, |ui| {
+                            // ui.label("L\\H");
                             for head in 0..info.num_head {
-                                ui.label(format!("Head {head}"));
+                                ui.label(format!("{head}"));
                             }
                             ui.end_row();
 
                             for layer in 0..info.num_layer {
-                                ui.label(format!("Layer {layer}"));
+                                ui.label(format!("{layer}"));
 
                                 for head in 0..info.num_head {
+                                    let mode = *mode;
                                     let token = *token;
                                     let scale = 10.0_f32.powi(*scale);
+
+                                    let size = match mode {
+                                        Mode::Kv => info.num_emb / info.num_head,
+                                        Mode::Rkv => info.num_emb / info.num_head,
+                                        Mode::Rk => 8,
+                                    };
+
                                     let key = HeadKey { layer, head, token };
                                     let mut image = egui::epaint::ColorImage::new(
                                         [size, size],
                                         egui::Color32::BLACK,
                                     );
-                                    if let Some(kv) = match *show_rkv {
-                                        true => rkv.get(&key),
-                                        false => kv.get(&key),
+                                    if let Some(kv) = match mode {
+                                        Mode::Rkv => rkv.get(&key).cloned(),
+                                        Mode::Kv => kv.get(&key).cloned(),
+                                        Mode::Rk => rk.get(&key).map(|&x| vec![x; size * size]),
                                     } {
                                         for (pixel, kv) in image.pixels.iter_mut().zip_eq(kv.iter())
                                         {
@@ -584,19 +612,16 @@ async fn run(ui: Ui) -> Result<()> {
                                             }
                                         }
                                     }
-                                    let mut textures = match *show_rkv {
-                                        true => rkv_textures.lock().unwrap(),
-                                        false => kv_textures.lock().unwrap(),
-                                    };
-                                    let texture = match textures.get(&key) {
+                                    let mut textures = textures.lock().unwrap();
+                                    let texture = match textures.get(&(mode, key)) {
                                         Some(texture) => texture.clone(),
                                         None => {
                                             let texture = ctx.load_texture(
-                                                format!("kv_{:?}", key),
+                                                format!("{:?}_{:?}", mode, key),
                                                 image,
                                                 Default::default(),
                                             );
-                                            textures.insert(key, texture.clone());
+                                            textures.insert((mode, key), texture.clone());
                                             texture
                                         }
                                     };

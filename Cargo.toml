@@ -10,7 +10,7 @@ anyhow = "1.0"
 bytemuck = { version = "1.13", features = ["extern_crate_alloc"] }
 clap = { version = "4.3", features = ["derive"] }
 eframe = "0.27.2"
-egui = "0.27.2"
+egui = { version = "0.27.2", features = ["default", "serde"] }
 flume = "0.11"
 half = { version = "2.2", features = ["bytemuck", "serde"] }
 image = { version = "0.24", default-features = false, features = ["png"] }
