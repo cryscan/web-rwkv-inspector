@@ -536,7 +536,31 @@ async fn run(ui: Ui) -> Result<()> {
                         ui.horizontal_wrapped(|ui| {
                             for (index, word) in decoded.iter().enumerate() {
                                 let text = match index.cmp(&source) {
-                                    Ordering::Less => egui::RichText::new(word),
+                                    Ordering::Less => {
+                                        let layer = *layer;
+                                        let head = *head;
+                                        let token = *source;
+                                        let source = index;
+                                        let scale = 10.0_f32.powi(*scale);
+
+                                        let key = HeadKey {
+                                            layer,
+                                            head,
+                                            source,
+                                            token,
+                                        };
+                                        if let Some(rk) = rk.get(&key) {
+                                            let rk = (rk * scale).clamp(-1.0, 1.0);
+                                            let color = if rk >= 0.0 {
+                                                egui::Color32::LIGHT_RED.gamma_multiply(rk)
+                                            } else {
+                                                egui::Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                            };
+                                            egui::RichText::new(word).color(color)
+                                        } else {
+                                            egui::RichText::new(word)
+                                        }
+                                    }
                                     Ordering::Equal => {
                                         let color = egui::Color32::LIGHT_BLUE;
                                         egui::RichText::new(word).color(color)
