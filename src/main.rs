@@ -45,6 +45,7 @@ struct HookDataGpu {
     v: TensorGpu<f32, ReadWrite>,
     r: TensorGpu<f32, ReadWrite>,
     w: TensorGpu<f32, ReadWrite>,
+    g: TensorGpu<f32, ReadWrite>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -53,6 +54,7 @@ struct HookDataCpu {
     v: Vec<Vec<f32>>,
     r: Vec<Vec<f32>>,
     w: Vec<Vec<f32>>,
+    g: Vec<Vec<f32>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -61,6 +63,7 @@ struct HeadKey {
     head: usize,
     source: usize,
     token: usize,
+    gated: bool,
 }
 
 async fn create_context(info: &ModelInfo) -> Result<Context> {
@@ -139,6 +142,7 @@ async fn load_runtime(ui: Ui, path: PathBuf) -> Result<Runtime> {
                 v: context.tensor_init(shape),
                 r: context.tensor_init(shape),
                 w: context.tensor_init(shape),
+                g: context.tensor_init(shape),
             }
         })
         .collect_vec();
@@ -166,6 +170,10 @@ async fn load_runtime(ui: Ui, path: PathBuf) -> Result<Runtime> {
                     TensorOp::blit(
                         frame.buffer.time_decay.view(.., .., .., ..)?,
                         data.w.view(.., ..num_token, .., ..)?,
+                    )?,
+                    TensorOp::blit(
+                        frame.buffer.att_g.view(.., .., .., ..)?,
+                        data.g.view(.., ..num_token, .., ..)?,
                     )?,
                 ];
 
@@ -418,14 +426,17 @@ async fn run(ui: Ui) -> Result<()> {
                 let mut v = split(gpu.v.back().await);
                 let mut r = split(gpu.r.back().await);
                 let mut w = split(gpu.w.back().await);
+                let mut g = split(gpu.g.back().await);
                 k.truncate(num_token);
                 v.truncate(num_token);
                 r.truncate(num_token);
                 w.truncate(num_token);
+                g.truncate(num_token);
                 cpu.k.append(&mut k);
                 cpu.v.append(&mut v);
                 cpu.r.append(&mut r);
                 cpu.w.append(&mut w);
+                cpu.g.append(&mut g);
             }
 
             if inference
@@ -445,7 +456,7 @@ async fn run(ui: Ui) -> Result<()> {
 
             let size = info.num_emb / info.num_head;
             let (tx, rx) = flume::unbounded();
-            let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1) / 2;
+            let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1);
 
             for layer in 0..info.num_layer {
                 let info = runtime.model.info.clone();
@@ -459,6 +470,7 @@ async fn run(ui: Ui) -> Result<()> {
 
                         for source in 0..num_token {
                             let mut k = data[layer].k[source][start..end].to_vec();
+                            let v = &data[layer].v[source][start..end];
 
                             for token in source + 1..num_token {
                                 let w = &data[layer].w[token][start..end];
@@ -473,9 +485,27 @@ async fn run(ui: Ui) -> Result<()> {
                                     head,
                                     source,
                                     token,
+                                    gated: false,
                                 };
 
                                 let Ok(_) = tx.send((key, dot)) else {
+                                    return;
+                                };
+
+                                let g = &data[layer].g[token][start..end];
+                                let g = g.iter().map(|x| x / (1.0 + (-x).exp()));
+
+                                let out: f32 = g.zip_eq(v).map(|(g, v)| (g * v).abs()).sum();
+                                let out = out / size as f32;
+                                let key = HeadKey {
+                                    layer,
+                                    head,
+                                    source,
+                                    token,
+                                    gated: true,
+                                };
+
+                                let Ok(_) = tx.send((key, out * dot)) else {
                                     return;
                                 };
                             }
@@ -513,6 +543,7 @@ async fn run(ui: Ui) -> Result<()> {
 
             let info = runtime.model.info.clone();
             let decoded = decoded.clone();
+            let gated = Mutex::new(false);
             let scale = Mutex::new(0);
             let source = Mutex::new(0usize);
             let layer = Mutex::new(0usize);
@@ -521,12 +552,14 @@ async fn run(ui: Ui) -> Result<()> {
             let (tx, rx) = flume::unbounded();
             let _inspect_ui = ui.create(move |ctx, _| {
                 egui::Window::new("Inspector").show(ctx, |ui| {
+                    let mut gated = gated.lock().unwrap();
                     let mut scale = scale.lock().unwrap();
                     let mut source = source.lock().unwrap();
                     let mut layer = layer.lock().unwrap();
                     let mut head = head.lock().unwrap();
 
-                    ui.add(egui::Slider::new(&mut *scale, -3..=0).text("Scale"));
+                    ui.add(egui::Checkbox::new(&mut *gated, "Gated"));
+                    ui.add(egui::Slider::new(&mut *scale, -6..=0).text("Scale"));
                     ui.add(egui::Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
                     ui.add(egui::Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
                     ui.add(egui::Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
@@ -541,6 +574,7 @@ async fn run(ui: Ui) -> Result<()> {
                                         let head = *head;
                                         let token = *source;
                                         let source = index;
+                                        let gated = *gated;
                                         let scale = 10.0_f32.powi(*scale);
 
                                         let key = HeadKey {
@@ -548,6 +582,7 @@ async fn run(ui: Ui) -> Result<()> {
                                             head,
                                             source,
                                             token,
+                                            gated,
                                         };
                                         if let Some(rk) = rk.get(&key) {
                                             let rk = (rk * scale).clamp(-1.0, 1.0);
@@ -570,6 +605,7 @@ async fn run(ui: Ui) -> Result<()> {
                                         let head = *head;
                                         let source = *source;
                                         let token = index;
+                                        let gated = *gated;
                                         let scale = 10.0_f32.powi(*scale);
 
                                         let key = HeadKey {
@@ -577,6 +613,7 @@ async fn run(ui: Ui) -> Result<()> {
                                             head,
                                             source,
                                             token,
+                                            gated,
                                         };
                                         if let Some(rk) = rk.get(&key) {
                                             let rk = (rk * scale).clamp(-1.0, 1.0);
