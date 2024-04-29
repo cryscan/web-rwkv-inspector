@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    path::PathBuf,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -83,49 +82,15 @@ async fn load_tokenizer() -> Result<Tokenizer> {
     Ok(Tokenizer::new(&contents)?)
 }
 
-async fn load_runtime(ui: Ui, path: PathBuf) -> Result<Runtime> {
+async fn load_runtime(
+    context: &Context,
+    data: &[u8],
+    quant: HashMap<usize, Quant>,
+) -> Result<Runtime> {
     let tokenizer = Arc::new(load_tokenizer().await?);
 
-    let file = File::open(path).await?;
-    let data = unsafe { Mmap::map(&file)? };
-
-    let model = SafeTensors::deserialize(&data)?;
-    let info = Loader::info(&model)?;
-    log::info!("{:#?}", info);
-
-    if !matches!(info.version, ModelVersion::V6) {
-        bail!("only supports V6 models");
-    }
-
-    let quant = {
-        let (tx, rx) = flume::unbounded();
-        let quant = Mutex::new(0usize);
-        let quant_nf4 = Mutex::new(0usize);
-        let _load_ui = ui.create(move |ctx, _| {
-            let mut quant = quant.lock().unwrap();
-            let mut quant_nf4 = quant_nf4.lock().unwrap();
-
-            egui::Window::new("Configure").show(ctx, |ui| {
-                ui.add(egui::Slider::new(&mut *quant, 0..=info.num_layer).text("Int8 Layers"));
-                ui.add(egui::Slider::new(&mut *quant_nf4, 0..=info.num_layer).text("NF4 Layers"));
-
-                ui.separator();
-                if ui.button("Load").clicked() {
-                    let quant = (0..*quant)
-                        .map(|layer| (layer, Quant::Int8))
-                        .chain((0..*quant_nf4).map(|layer| (layer, Quant::NF4)))
-                        .collect();
-                    let _ = tx.send(quant);
-                }
-            });
-        });
-        rx.recv_async().await?
-    };
-
-    let context = create_context(&info).await?;
-    log::info!("{:#?}", context.adapter.get_info());
-
-    let builder = ModelBuilder::new(&context, model).quant(quant);
+    let model = SafeTensors::deserialize(data)?;
+    let builder = ModelBuilder::new(context, model).quant(quant);
     let model = Build::<v6::Model>::build(builder).await?;
 
     let data = (0..model.info.num_layer)
@@ -269,7 +234,57 @@ async fn run(ui: Ui) -> Result<()> {
             })
         };
 
-        match load_runtime(ui.clone(), path).await {
+        let file = File::open(path).await?;
+        let data = unsafe { Mmap::map(&file)? };
+
+        let model = SafeTensors::deserialize(&data)?;
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        if !matches!(info.version, ModelVersion::V6) {
+            bail!("only supports V6 models");
+        }
+
+        let quant = {
+            let (tx, rx) = flume::unbounded();
+            let quant = Mutex::new(0usize);
+            let quant_nf4 = Mutex::new(0usize);
+            let _load_ui = ui.create(move |ctx, _| {
+                use egui::{Slider, Window};
+
+                let mut quant = quant.lock().unwrap();
+                let mut quant_nf4 = quant_nf4.lock().unwrap();
+
+                Window::new("Configure").show(ctx, |ui| {
+                    ui.add(Slider::new(&mut *quant, 0..=info.num_layer).text("Int8 Layers"));
+                    ui.add(Slider::new(&mut *quant_nf4, 0..=info.num_layer).text("NF4 Layers"));
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Load").clicked() {
+                            let quant = (0..*quant)
+                                .map(|layer| (layer, Quant::Int8))
+                                .chain((0..*quant_nf4).map(|layer| (layer, Quant::NF4)))
+                                .collect();
+                            let _ = tx.send(Some(quant));
+                        }
+                        if ui.button("Back").clicked() {
+                            let _ = tx.send(None);
+                        }
+                    })
+                });
+            });
+
+            match rx.recv_async().await? {
+                Some(quant) => quant,
+                _ => continue 'load,
+            }
+        };
+
+        let context = create_context(&info).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        match load_runtime(&context, &data, quant).await {
             Ok(runtime) => break 'load runtime,
             Err(err) => {
                 drop(ui_load);
@@ -291,8 +306,10 @@ async fn run(ui: Ui) -> Result<()> {
     let _ui_info = {
         let info = runtime.model.info.clone();
         ui.create(move |ctx, _| {
-            egui::Window::new("Info").show(ctx, |ui| {
-                egui::Grid::new("grid")
+            use egui::{Grid, Window};
+
+            Window::new("Info").show(ctx, |ui| {
+                Grid::new("grid")
                     .num_columns(2)
                     .spacing([40.0, 4.0])
                     .striped(true)
@@ -335,29 +352,29 @@ async fn run(ui: Ui) -> Result<()> {
         let text = Mutex::new(String::new());
 
         let ui_input = ui.create(move |ctx, _| {
-            egui::Window::new("Input")
-                .max_height(400.0)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if *input_rx.borrow() {
-                            let mut text = text.lock().unwrap();
-                            ui.text_edit_multiline(&mut *text);
-                        } else {
-                            let text = text.lock().unwrap();
-                            ui.label(&*text);
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Submit").clicked() {
-                            let text = text.lock().unwrap();
-                            let _ = tx.send(text.clone());
-                        }
-                        if !*input_rx.borrow() {
-                            ui.spinner();
-                        }
-                    });
+            use egui::{ScrollArea, Window};
+
+            Window::new("Input").max_height(400.0).show(ctx, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    if *input_rx.borrow() {
+                        let mut text = text.lock().unwrap();
+                        ui.text_edit_multiline(&mut *text);
+                    } else {
+                        let text = text.lock().unwrap();
+                        ui.label(&*text);
+                    }
                 });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Submit").clicked() {
+                        let text = text.lock().unwrap();
+                        let _ = tx.send(text.clone());
+                    }
+                    if !*input_rx.borrow() {
+                        ui.spinner();
+                    }
+                });
+            });
         });
 
         let input = rx.recv_async().await?;
@@ -486,19 +503,21 @@ async fn run(ui: Ui) -> Result<()> {
 
             let (processed_tx, processed_rx) = tokio::sync::watch::channel(0usize);
             let _process_ui = ui.create(move |ctx, _| {
-                egui::Window::new("Inspector").show(ctx, |ui| {
+                use egui::{ProgressBar, Window};
+
+                Window::new("Inspector").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Processing tokens...");
                         ui.spinner();
                     });
 
                     let progress = *processed_rx.borrow() as f32 / total_rk as f32;
-                    ui.add(egui::ProgressBar::new(progress));
+                    ui.add(ProgressBar::new(progress));
                 });
             });
 
-            while *processed_tx.borrow() < total_rk {
-                let (key, value) = rx.recv_async().await?;
+            drop(tx);
+            while let Ok((key, value)) = rx.recv_async().await {
                 rk.insert(key, value);
                 processed_tx.send_modify(|count| *count += 1);
             }
@@ -507,10 +526,6 @@ async fn run(ui: Ui) -> Result<()> {
         };
 
         {
-            enum InspectorEvent {
-                Back,
-            }
-
             let info = runtime.model.info.clone();
             let decoded = decoded.clone();
             let scale = Mutex::new(0);
@@ -520,19 +535,21 @@ async fn run(ui: Ui) -> Result<()> {
 
             let (tx, rx) = flume::unbounded();
             let _inspect_ui = ui.create(move |ctx, _| {
-                egui::Window::new("Inspector").show(ctx, |ui| {
+                use egui::{Color32, Label, RichText, ScrollArea, Sense, Slider, Window};
+
+                Window::new("Inspector").show(ctx, |ui| {
                     let mut scale = scale.lock().unwrap();
                     let mut source = source.lock().unwrap();
                     let mut layer = layer.lock().unwrap();
                     let mut head = head.lock().unwrap();
 
-                    ui.add(egui::Slider::new(&mut *scale, -3..=0).text("Scale"));
-                    ui.add(egui::Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
-                    ui.add(egui::Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
-                    ui.add(egui::Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
+                    ui.add(Slider::new(&mut *scale, -3..=0).text("Scale"));
+                    ui.add(Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
+                    ui.add(Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
+                    ui.add(Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
                     ui.separator();
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    ScrollArea::vertical().show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for (index, word) in decoded.iter().enumerate() {
                                 let text = match index.cmp(&source) {
@@ -552,18 +569,18 @@ async fn run(ui: Ui) -> Result<()> {
                                         if let Some(rk) = rk.get(&key) {
                                             let rk = (rk * scale).clamp(-1.0, 1.0);
                                             let color = if rk >= 0.0 {
-                                                egui::Color32::LIGHT_RED.gamma_multiply(rk)
+                                                Color32::LIGHT_RED.gamma_multiply(rk)
                                             } else {
-                                                egui::Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                                Color32::LIGHT_GREEN.gamma_multiply(-rk)
                                             };
-                                            egui::RichText::new(word).color(color)
+                                            RichText::new(word).color(color)
                                         } else {
-                                            egui::RichText::new(word)
+                                            RichText::new(word)
                                         }
                                     }
                                     Ordering::Equal => {
-                                        let color = egui::Color32::LIGHT_BLUE;
-                                        egui::RichText::new(word).color(color)
+                                        let color = Color32::LIGHT_BLUE;
+                                        RichText::new(word).color(color)
                                     }
                                     Ordering::Greater => {
                                         let layer = *layer;
@@ -581,17 +598,17 @@ async fn run(ui: Ui) -> Result<()> {
                                         if let Some(rk) = rk.get(&key) {
                                             let rk = (rk * scale).clamp(-1.0, 1.0);
                                             let color = if rk >= 0.0 {
-                                                egui::Color32::LIGHT_RED.gamma_multiply(rk)
+                                                Color32::LIGHT_RED.gamma_multiply(rk)
                                             } else {
-                                                egui::Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                                Color32::LIGHT_GREEN.gamma_multiply(-rk)
                                             };
-                                            egui::RichText::new(word).color(color)
+                                            RichText::new(word).color(color)
                                         } else {
-                                            egui::RichText::new(word)
+                                            RichText::new(word)
                                         }
                                     }
                                 };
-                                let label = egui::Label::new(text).sense(egui::Sense::click());
+                                let label = Label::new(text).sense(Sense::click());
                                 if ui.add(label).clicked() {
                                     *source = index;
                                 }
@@ -601,14 +618,13 @@ async fn run(ui: Ui) -> Result<()> {
 
                     ui.separator();
                     if ui.button("Back").clicked() {
-                        let _ = tx.send(InspectorEvent::Back);
+                        let _ = tx.send(());
                     }
                 });
             });
 
-            match rx.recv_async().await? {
-                InspectorEvent::Back => continue 'input,
-            }
+            rx.recv_async().await?;
+            continue 'input;
         }
     }
 }
