@@ -459,7 +459,8 @@ async fn run(ui: Ui) -> Result<()> {
             }
         };
 
-        let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let (tx, rx) = flume::unbounded();
+        tokio::task::spawn_blocking(move || -> Result<()> {
             use std::{fs::File, io::Write};
 
             struct FileWriter(File);
@@ -474,9 +475,21 @@ async fn run(ui: Ui) -> Result<()> {
             let file = FileWriter(File::create(path)?);
             let mut serializer = cbor4ii::serde::Serializer::new(file);
 
-            Ok(pack.serialize(&mut serializer)?)
+            pack.serialize(&mut serializer)?;
+            let _ = tx.send(());
+            Ok(())
         });
-        handle.await??;
+
+        let _save_ui = ui.create(|ctx, _| {
+            egui::Window::new("Save").title_bar(false).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Saving trace file...");
+                    ui.spinner();
+                });
+            });
+        });
+
+        rx.recv_async().await?;
     }
 }
 
