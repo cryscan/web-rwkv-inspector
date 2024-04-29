@@ -9,6 +9,7 @@ use half::f16;
 use itertools::Itertools;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
@@ -46,12 +47,19 @@ struct HookDataGpu {
     w: TensorGpu<f32, ReadWrite>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct HookDataCpu {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     r: Vec<Vec<f32>>,
     w: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Pack {
+    info: ModelInfo,
+    decoded: Vec<String>,
+    data: Vec<HookDataCpu>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -206,9 +214,9 @@ async fn run(ui: Ui) -> Result<()> {
         let path = {
             let (tx, rx) = flume::unbounded();
             let _ui_load = ui.create(move |ctx, _| {
-                egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
+                egui::Window::new("Model").title_bar(false).show(ctx, |ui| {
                     ui.label("Choose a model file.");
-                    ui.add_space(4.0);
+                    ui.separator();
                     if ui.button("Open...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("SafeTensors", &["st"])
@@ -288,7 +296,6 @@ async fn run(ui: Ui) -> Result<()> {
             Ok(runtime) => break 'load runtime,
             Err(err) => {
                 drop(ui_load);
-
                 let (tx, rx) = flume::unbounded();
                 let _ui_load = ui.create(move |ctx, _| {
                     egui::Window::new("Load").title_bar(false).show(ctx, |ui| {
@@ -303,48 +310,7 @@ async fn run(ui: Ui) -> Result<()> {
         }
     };
 
-    let _ui_info = {
-        let info = runtime.model.info.clone();
-        ui.create(move |ctx, _| {
-            use egui::{Grid, Window};
-
-            Window::new("Info").show(ctx, |ui| {
-                Grid::new("grid")
-                    .num_columns(2)
-                    .spacing([40.0, 4.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("Version");
-                        ui.label(format!("{:?}", info.version));
-                        ui.end_row();
-
-                        ui.label("Layer Count");
-                        ui.label(format!("{}", info.num_layer));
-                        ui.end_row();
-
-                        ui.label("Vocab Size");
-                        ui.label(format!("{}", info.num_vocab));
-                        ui.end_row();
-
-                        ui.label("Embed Size");
-                        ui.label(format!("{}", info.num_emb));
-                        ui.end_row();
-
-                        ui.label("FFN Size");
-                        ui.label(format!("{}", info.num_hidden));
-                        ui.end_row();
-
-                        ui.label("Head Count");
-                        ui.label(format!("{}", info.num_head));
-                        ui.end_row();
-
-                        ui.label("Head Size");
-                        ui.label(format!("{}", info.num_emb / info.num_head));
-                        ui.end_row();
-                    });
-            });
-        })
-    };
+    let _ui_info = info_ui(ui.clone(), runtime.model.info.clone()).await;
 
     'input: loop {
         let (tx, rx) = flume::unbounded();
@@ -382,7 +348,6 @@ async fn run(ui: Ui) -> Result<()> {
             continue 'input;
         };
         tokens.truncate(MAX_INPUT_TOKENS);
-        let num_token = tokens.len();
 
         if tokens.is_empty() {
             continue 'input;
@@ -455,178 +420,333 @@ async fn run(ui: Ui) -> Result<()> {
         }
         drop(ui_input);
 
-        let rk = {
-            let info = runtime.model.info.clone();
-            let data = Arc::new(data);
-            let mut rk = HashMap::new();
+        let info = runtime.model.info.clone();
+        let pack = Pack {
+            info,
+            decoded,
+            data,
+        };
 
-            let size = info.num_emb / info.num_head;
+        inspect(ui.clone(), pack.clone()).await?;
+
+        let path = {
             let (tx, rx) = flume::unbounded();
-            let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1) / 2;
+            let _ui_load = ui.create(move |ctx, _| {
+                egui::Window::new("Save").title_bar(false).show(ctx, |ui| {
+                    ui.label("Save the trace?");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Trace", &["tr"])
+                                .save_file()
+                            {
+                                let _ = tx.send(Some(path));
+                            }
+                        }
+                        if ui.button("Back").clicked() {
+                            let _ = tx.send(None);
+                        }
+                    });
+                });
+            });
+            match rx.recv_async().await? {
+                Some(path) => path,
+                None => continue 'input,
+            }
+        };
 
-            for layer in 0..info.num_layer {
-                let info = runtime.model.info.clone();
-                let data = data.clone();
-                let tx = tx.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::{fs::File, io::Write};
 
-                tokio::task::spawn_blocking(move || {
-                    for head in 0..info.num_head {
-                        let start = size * head;
-                        let end = start + size;
+            struct FileWriter(File);
+            impl cbor4ii::core::enc::Write for FileWriter {
+                type Error = std::io::Error;
 
-                        for source in 0..num_token {
-                            let mut k = data[layer].k[source][start..end].to_vec();
+                fn push(&mut self, input: &[u8]) -> Result<(), Self::Error> {
+                    self.0.write_all(input)
+                }
+            }
 
-                            for token in source + 1..num_token {
-                                let w = &data[layer].w[token][start..end];
-                                let r = &data[layer].r[token][start..end];
-                                for (k, w) in k.iter_mut().zip_eq(w) {
-                                    *k *= w;
-                                }
+            let file = FileWriter(File::create(path)?);
+            let mut serializer = cbor4ii::serde::Serializer::new(file);
 
-                                let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
+            Ok(pack.serialize(&mut serializer)?)
+        });
+        handle.await??;
+    }
+}
+
+async fn trace(ui: Ui) -> Result<()> {
+    'trace: loop {
+        let path = {
+            let (tx, rx) = flume::unbounded();
+            let _ui_load = ui.create(move |ctx, _| {
+                egui::Window::new("Trace").title_bar(false).show(ctx, |ui| {
+                    ui.label("Choose a trace file.");
+                    ui.separator();
+                    if ui.button("Open...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Trace", &["tr"])
+                            .pick_file()
+                        {
+                            let _ = tx.send(path);
+                        }
+                    }
+                });
+            });
+            rx.recv_async().await?
+        };
+
+        let file = File::open(path).await?;
+        let data = unsafe { Mmap::map(&file)? };
+
+        let pack = match cbor4ii::serde::from_slice::<Pack>(&data) {
+            Ok(pack) => pack,
+            Err(err) => {
+                let (tx, rx) = flume::unbounded();
+                let _ui_load = ui.create(move |ctx, _| {
+                    egui::Window::new("Trace").title_bar(false).show(ctx, |ui| {
+                        ui.label(format!("Error: {}", err));
+                        if ui.button("Ok").clicked() {
+                            let _ = tx.send(());
+                        }
+                    });
+                });
+                rx.recv_async().await?;
+                continue 'trace;
+            }
+        };
+
+        let _ui_info = info_ui(ui.clone(), pack.info.clone()).await;
+
+        inspect(ui.clone(), pack).await?;
+    }
+}
+
+async fn info_ui(ui: Ui, info: ModelInfo) -> UiHandle {
+    ui.create(move |ctx, _| {
+        use egui::{Grid, Window};
+
+        Window::new("Info").show(ctx, |ui| {
+            Grid::new("grid")
+                .num_columns(2)
+                .spacing([40.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Version");
+                    ui.label(format!("{:?}", info.version));
+                    ui.end_row();
+
+                    ui.label("Layer Count");
+                    ui.label(format!("{}", info.num_layer));
+                    ui.end_row();
+
+                    ui.label("Vocab Size");
+                    ui.label(format!("{}", info.num_vocab));
+                    ui.end_row();
+
+                    ui.label("Embed Size");
+                    ui.label(format!("{}", info.num_emb));
+                    ui.end_row();
+
+                    ui.label("FFN Size");
+                    ui.label(format!("{}", info.num_hidden));
+                    ui.end_row();
+
+                    ui.label("Head Count");
+                    ui.label(format!("{}", info.num_head));
+                    ui.end_row();
+
+                    ui.label("Head Size");
+                    ui.label(format!("{}", info.num_emb / info.num_head));
+                    ui.end_row();
+                });
+        });
+    })
+}
+
+async fn inspect(
+    ui: Ui,
+    Pack {
+        info,
+        decoded,
+        data,
+    }: Pack,
+) -> Result<()> {
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    struct InspectId;
+
+    let ui_id = uid::Id::<InspectId>::new();
+
+    let rk = {
+        let num_token = decoded.len();
+        let data = Arc::new(data);
+        let mut rk = HashMap::new();
+
+        let size = info.num_emb / info.num_head;
+        let (tx, rx) = flume::unbounded();
+        let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1) / 2;
+
+        for layer in 0..info.num_layer {
+            let info = info.clone();
+            let data = data.clone();
+            let tx = tx.clone();
+
+            tokio::task::spawn_blocking(move || {
+                for head in 0..info.num_head {
+                    let start = size * head;
+                    let end = start + size;
+
+                    for source in 0..num_token {
+                        let mut k = data[layer].k[source][start..end].to_vec();
+
+                        for token in source + 1..num_token {
+                            let w = &data[layer].w[token][start..end];
+                            let r = &data[layer].r[token][start..end];
+                            for (k, w) in k.iter_mut().zip_eq(w) {
+                                *k *= w;
+                            }
+
+                            let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
+                            let key = HeadKey {
+                                layer,
+                                head,
+                                source,
+                                token,
+                            };
+
+                            let Ok(_) = tx.send((key, dot)) else {
+                                return;
+                            };
+                        }
+                    }
+                }
+            });
+        }
+
+        let (processed_tx, processed_rx) = tokio::sync::watch::channel(0usize);
+        let _process_ui = ui.create(move |ctx, _| {
+            use egui::{Id, ProgressBar, Window};
+
+            Window::new("Inspector").id(Id::new(ui_id)).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Processing tokens...");
+                    ui.spinner();
+                });
+
+                let progress = *processed_rx.borrow() as f32 / total_rk as f32;
+                ui.add(ProgressBar::new(progress));
+            });
+        });
+
+        drop(tx);
+        while let Ok((key, value)) = rx.recv_async().await {
+            rk.insert(key, value);
+            processed_tx.send_modify(|count| *count += 1);
+        }
+
+        rk
+    };
+
+    let num_token = decoded.len();
+    let scale = Mutex::new(0);
+    let source = Mutex::new(0usize);
+    let layer = Mutex::new(0usize);
+    let head = Mutex::new(0usize);
+
+    let (tx, rx) = flume::unbounded();
+    let _inspect_ui = ui.create(move |ctx, _| {
+        use egui::{Color32, Id, Label, RichText, ScrollArea, Sense, Slider, Window};
+
+        Window::new("Inspector").id(Id::new(ui_id)).show(ctx, |ui| {
+            let mut scale = scale.lock().unwrap();
+            let mut source = source.lock().unwrap();
+            let mut layer = layer.lock().unwrap();
+            let mut head = head.lock().unwrap();
+
+            ui.add(Slider::new(&mut *scale, -3..=0).text("Scale"));
+            ui.add(Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
+            ui.add(Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
+            ui.add(Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
+            ui.separator();
+
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (index, word) in decoded.iter().enumerate() {
+                        let text = match index.cmp(&source) {
+                            Ordering::Less => {
+                                let layer = *layer;
+                                let head = *head;
+                                let token = *source;
+                                let source = index;
+                                let scale = 10.0_f32.powi(*scale);
+
                                 let key = HeadKey {
                                     layer,
                                     head,
                                     source,
                                     token,
                                 };
-
-                                let Ok(_) = tx.send((key, dot)) else {
-                                    return;
-                                };
+                                if let Some(rk) = rk.get(&key) {
+                                    let rk = (rk * scale).clamp(-1.0, 1.0);
+                                    let color = if rk >= 0.0 {
+                                        Color32::LIGHT_RED.gamma_multiply(rk)
+                                    } else {
+                                        Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                    };
+                                    RichText::new(word).color(color)
+                                } else {
+                                    RichText::new(word)
+                                }
                             }
+                            Ordering::Equal => {
+                                let color = Color32::LIGHT_BLUE;
+                                RichText::new(word).color(color)
+                            }
+                            Ordering::Greater => {
+                                let layer = *layer;
+                                let head = *head;
+                                let source = *source;
+                                let token = index;
+                                let scale = 10.0_f32.powi(*scale);
+
+                                let key = HeadKey {
+                                    layer,
+                                    head,
+                                    source,
+                                    token,
+                                };
+                                if let Some(rk) = rk.get(&key) {
+                                    let rk = (rk * scale).clamp(-1.0, 1.0);
+                                    let color = if rk >= 0.0 {
+                                        Color32::LIGHT_RED.gamma_multiply(rk)
+                                    } else {
+                                        Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                    };
+                                    RichText::new(word).color(color)
+                                } else {
+                                    RichText::new(word)
+                                }
+                            }
+                        };
+                        let label = Label::new(text).sense(Sense::click());
+                        if ui.add(label).clicked() {
+                            *source = index;
                         }
                     }
                 });
-            }
-
-            let (processed_tx, processed_rx) = tokio::sync::watch::channel(0usize);
-            let _process_ui = ui.create(move |ctx, _| {
-                use egui::{ProgressBar, Window};
-
-                Window::new("Inspector").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Processing tokens...");
-                        ui.spinner();
-                    });
-
-                    let progress = *processed_rx.borrow() as f32 / total_rk as f32;
-                    ui.add(ProgressBar::new(progress));
-                });
             });
 
-            drop(tx);
-            while let Ok((key, value)) = rx.recv_async().await {
-                rk.insert(key, value);
-                processed_tx.send_modify(|count| *count += 1);
+            ui.separator();
+            if ui.button("Back").clicked() {
+                let _ = tx.send(());
             }
+        });
+    });
 
-            rk
-        };
-
-        {
-            let info = runtime.model.info.clone();
-            let decoded = decoded.clone();
-            let scale = Mutex::new(0);
-            let source = Mutex::new(0usize);
-            let layer = Mutex::new(0usize);
-            let head = Mutex::new(0usize);
-
-            let (tx, rx) = flume::unbounded();
-            let _inspect_ui = ui.create(move |ctx, _| {
-                use egui::{Color32, Label, RichText, ScrollArea, Sense, Slider, Window};
-
-                Window::new("Inspector").show(ctx, |ui| {
-                    let mut scale = scale.lock().unwrap();
-                    let mut source = source.lock().unwrap();
-                    let mut layer = layer.lock().unwrap();
-                    let mut head = head.lock().unwrap();
-
-                    ui.add(Slider::new(&mut *scale, -3..=0).text("Scale"));
-                    ui.add(Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
-                    ui.add(Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
-                    ui.add(Slider::new(&mut *head, 0..=info.num_head - 1).text("Head"));
-                    ui.separator();
-
-                    ScrollArea::vertical().show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            for (index, word) in decoded.iter().enumerate() {
-                                let text = match index.cmp(&source) {
-                                    Ordering::Less => {
-                                        let layer = *layer;
-                                        let head = *head;
-                                        let token = *source;
-                                        let source = index;
-                                        let scale = 10.0_f32.powi(*scale);
-
-                                        let key = HeadKey {
-                                            layer,
-                                            head,
-                                            source,
-                                            token,
-                                        };
-                                        if let Some(rk) = rk.get(&key) {
-                                            let rk = (rk * scale).clamp(-1.0, 1.0);
-                                            let color = if rk >= 0.0 {
-                                                Color32::LIGHT_RED.gamma_multiply(rk)
-                                            } else {
-                                                Color32::LIGHT_GREEN.gamma_multiply(-rk)
-                                            };
-                                            RichText::new(word).color(color)
-                                        } else {
-                                            RichText::new(word)
-                                        }
-                                    }
-                                    Ordering::Equal => {
-                                        let color = Color32::LIGHT_BLUE;
-                                        RichText::new(word).color(color)
-                                    }
-                                    Ordering::Greater => {
-                                        let layer = *layer;
-                                        let head = *head;
-                                        let source = *source;
-                                        let token = index;
-                                        let scale = 10.0_f32.powi(*scale);
-
-                                        let key = HeadKey {
-                                            layer,
-                                            head,
-                                            source,
-                                            token,
-                                        };
-                                        if let Some(rk) = rk.get(&key) {
-                                            let rk = (rk * scale).clamp(-1.0, 1.0);
-                                            let color = if rk >= 0.0 {
-                                                Color32::LIGHT_RED.gamma_multiply(rk)
-                                            } else {
-                                                Color32::LIGHT_GREEN.gamma_multiply(-rk)
-                                            };
-                                            RichText::new(word).color(color)
-                                        } else {
-                                            RichText::new(word)
-                                        }
-                                    }
-                                };
-                                let label = Label::new(text).sense(Sense::click());
-                                if ui.add(label).clicked() {
-                                    *source = index;
-                                }
-                            }
-                        });
-                    });
-
-                    ui.separator();
-                    if ui.button("Back").clicked() {
-                        let _ = tx.send(());
-                    }
-                });
-            });
-
-            rx.recv_async().await?;
-            continue 'input;
-        }
-    }
+    rx.recv_async().await?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -640,7 +760,8 @@ async fn main() {
 
     let (app, sender) = App::new();
     let app = Box::new(app);
-    tokio::spawn(run(sender));
+    tokio::spawn(run(sender.clone()));
+    tokio::spawn(trace(sender));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
