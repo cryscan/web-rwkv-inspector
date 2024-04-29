@@ -20,7 +20,7 @@ use web_rwkv::{
     runtime::{
         infer::{InferInput, InferInputBatch, InferOption, InferOutput},
         loader::Loader,
-        model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
+        model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
         v6, JobRuntime, Submission,
     },
     tensor::{kind::ReadWrite, ops::TensorOp, TensorCpu, TensorGpu, TensorShape},
@@ -83,7 +83,7 @@ async fn load_tokenizer() -> Result<Tokenizer> {
     Ok(Tokenizer::new(&contents)?)
 }
 
-async fn load_runtime(path: PathBuf) -> Result<Runtime> {
+async fn load_runtime(ui: Ui, path: PathBuf) -> Result<Runtime> {
     let tokenizer = Arc::new(load_tokenizer().await?);
 
     let file = File::open(path).await?;
@@ -97,10 +97,35 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
         bail!("only supports V6 models");
     }
 
+    let quant = {
+        let (tx, rx) = flume::unbounded();
+        let quant = Mutex::new(0usize);
+        let quant_nf4 = Mutex::new(0usize);
+        let _load_ui = ui.create(move |ctx, _| {
+            let mut quant = quant.lock().unwrap();
+            let mut quant_nf4 = quant_nf4.lock().unwrap();
+
+            egui::Window::new("Configure").show(ctx, |ui| {
+                ui.add(egui::Slider::new(&mut *quant, 0..=info.num_layer).text("Int8 Layers"));
+                ui.add(egui::Slider::new(&mut *quant_nf4, 0..=info.num_layer).text("NF4 Layers"));
+
+                ui.separator();
+                if ui.button("Load").clicked() {
+                    let quant = (0..*quant)
+                        .map(|layer| (layer, Quant::Int8))
+                        .chain((0..*quant_nf4).map(|layer| (layer, Quant::NF4)))
+                        .collect();
+                    let _ = tx.send(quant);
+                }
+            });
+        });
+        rx.recv_async().await?
+    };
+
     let context = create_context(&info).await?;
     log::info!("{:#?}", context.adapter.get_info());
 
-    let builder = ModelBuilder::new(&context, model);
+    let builder = ModelBuilder::new(&context, model).quant(quant);
     let model = Build::<v6::Model>::build(builder).await?;
 
     let data = (0..model.info.num_layer)
@@ -162,8 +187,10 @@ async fn load_runtime(path: PathBuf) -> Result<Runtime> {
 
 type BoxUi = Box<dyn Fn(&egui::Context, &mut eframe::Frame) + Send + Sync>;
 
+#[derive(Debug, Clone)]
 struct UiHandle(Arc<()>);
 
+#[derive(Debug, Clone)]
 struct Ui(flume::Sender<(BoxUi, Weak<()>)>);
 
 impl Ui {
@@ -242,7 +269,7 @@ async fn run(ui: Ui) -> Result<()> {
             })
         };
 
-        match load_runtime(path).await {
+        match load_runtime(ui.clone(), path).await {
             Ok(runtime) => break 'load runtime,
             Err(err) => {
                 drop(ui_load);
@@ -268,6 +295,7 @@ async fn run(ui: Ui) -> Result<()> {
                 egui::Grid::new("grid")
                     .num_columns(2)
                     .spacing([40.0, 4.0])
+                    .striped(true)
                     .show(ui, |ui| {
                         ui.label("Version");
                         ui.label(format!("{:?}", info.version));
