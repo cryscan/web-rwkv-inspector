@@ -178,6 +178,9 @@ impl Ui {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+struct UiId;
+
 struct App {
     rx: flume::Receiver<(BoxUi, Weak<()>)>,
     ui: Vec<(BoxUi, Weak<()>)>,
@@ -525,10 +528,12 @@ async fn trace(ui: Ui) -> Result<()> {
 }
 
 async fn info_ui(ui: Ui, info: ModelInfo) -> UiHandle {
-    ui.create(move |ctx, _| {
-        use egui::{Grid, Window};
+    let ui_id = uid::Id::<UiId>::new();
 
-        Window::new("Info").show(ctx, |ui| {
+    ui.create(move |ctx, _| {
+        use egui::{Grid, Id, Window};
+
+        Window::new("Info").id(Id::new(ui_id)).show(ctx, |ui| {
             Grid::new("grid")
                 .num_columns(2)
                 .spacing([40.0, 4.0])
@@ -574,10 +579,7 @@ async fn inspect(
         data,
     }: Pack,
 ) -> Result<()> {
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-    struct InspectId;
-
-    let ui_id = uid::Id::<InspectId>::new();
+    let ui_id = uid::Id::<UiId>::new();
 
     let rk = {
         let num_token = decoded.len();
