@@ -619,11 +619,12 @@ async fn inspect(
                         for token in source + 1..num_token {
                             let w = &data[layer].w[token][start..end];
                             let r = &data[layer].r[token][start..end];
+
+                            let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
                             for (k, w) in k.iter_mut().zip_eq(w) {
                                 *k *= w;
                             }
 
-                            let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
                             let key = HeadKey {
                                 layer,
                                 head,
