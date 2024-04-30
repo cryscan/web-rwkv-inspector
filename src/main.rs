@@ -204,10 +204,13 @@ impl eframe::App for App {
             self.ui.push(ui);
         }
 
+        for ui in self.ui.iter() {
+            (ui.0)(ctx, frame);
+        }
+
         let mut retain = vec![];
         for ui in self.ui.drain(..) {
             if ui.1.upgrade().is_some() {
-                (ui.0)(ctx, frame);
                 retain.push(ui);
             }
         }
@@ -856,6 +859,29 @@ async fn inspect(
     Ok(())
 }
 
+async fn load_fonts(ui: Ui) -> Result<()> {
+    let path = "assets/fonts/NotoSansCJK-SC/NotoSansCJKsc-Regular.ttf";
+    let file = File::open(path).await?;
+    let data = unsafe { Mmap::map(&file)? };
+
+    ui.create(move |ctx, _| {
+        let data = data.to_vec();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("noto_sans".into(), egui::FontData::from_owned(data));
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .push("noto_sans".into());
+
+        ctx.set_fonts(fonts);
+    });
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     simple_logger::SimpleLogger::new()
@@ -865,10 +891,11 @@ async fn main() {
         .init()
         .unwrap();
 
-    let (app, sender) = App::new();
+    let (app, ui) = App::new();
     let app = Box::new(app);
-    tokio::spawn(run(sender.clone()));
-    tokio::spawn(trace(sender));
+    tokio::spawn(load_fonts(ui.clone()));
+    tokio::spawn(run(ui.clone()));
+    tokio::spawn(trace(ui));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
