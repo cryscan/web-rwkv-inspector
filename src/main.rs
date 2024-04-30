@@ -49,10 +49,10 @@ struct HookDataGpu {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct HookDataCpu {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
-    r: Vec<Vec<f32>>,
-    w: Vec<Vec<f32>>,
+    k: Vec<TensorCpu<f32>>,
+    v: Vec<TensorCpu<f32>>,
+    r: Vec<TensorCpu<f32>>,
+    w: Vec<TensorCpu<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,11 +387,11 @@ async fn run(ui: Ui) -> Result<()> {
             let post_num_token = input.batches[0].tokens.len();
             inference = Some(input);
 
-            fn split<F: Float>(x: TensorCpu<F>) -> Vec<Vec<f32>> {
+            fn split<F: Float>(x: TensorCpu<F>) -> Vec<TensorCpu<f32>> {
                 x.split(1)
                     .expect("split batch")
                     .into_iter()
-                    .map(|x| x.map(|&x| CoHom::co_hom(x)).to_vec())
+                    .map(|x| x.map(|&x| CoHom::co_hom(x)))
                     .collect()
             }
 
@@ -514,23 +514,25 @@ async fn trace(ui: Ui) -> Result<()> {
             rx.recv_async().await?
         };
 
-        let file = File::open(path).await?;
-        let data = unsafe { Mmap::map(&file)? };
+        let pack = {
+            let file = File::open(path).await?;
+            let data = unsafe { Mmap::map(&file)? };
 
-        let pack = match cbor4ii::serde::from_slice::<Pack>(&data) {
-            Ok(pack) => pack,
-            Err(err) => {
-                let (tx, rx) = flume::unbounded();
-                let _ui_load = ui.create(move |ctx, _| {
-                    egui::Window::new("Trace").title_bar(false).show(ctx, |ui| {
-                        ui.label(format!("Error: {}", err));
-                        if ui.button("Ok").clicked() {
-                            let _ = tx.send(());
-                        }
+            match cbor4ii::serde::from_slice::<Pack>(&data) {
+                Ok(pack) => pack,
+                Err(err) => {
+                    let (tx, rx) = flume::unbounded();
+                    let _ui_load = ui.create(move |ctx, _| {
+                        egui::Window::new("Trace").title_bar(false).show(ctx, |ui| {
+                            ui.label(format!("Error: {}", err));
+                            if ui.button("Ok").clicked() {
+                                let _ = tx.send(());
+                            }
+                        });
                     });
-                });
-                rx.recv_async().await?;
-                continue 'trace;
+                    rx.recv_async().await?;
+                    continue 'trace;
+                }
             }
         };
 
@@ -596,17 +598,20 @@ async fn inspect(
 
     let rk = {
         let num_token = decoded.len();
-        let data = Arc::new(data);
         let mut rk = HashMap::new();
 
         let size = info.num_emb / info.num_head;
         let (tx, rx) = flume::unbounded();
         let total_rk = info.num_layer * info.num_head * num_token * (num_token - 1) / 2;
 
-        for layer in 0..info.num_layer {
+        for (layer, data) in data.into_iter().enumerate() {
             let info = info.clone();
-            let data = data.clone();
             let tx = tx.clone();
+
+            let HookDataCpu { k, r, w, .. } = data;
+            let k = k.into_iter().map(|x| x.to_vec()).collect_vec();
+            let r = r.into_iter().map(|x| x.to_vec()).collect_vec();
+            let w = w.into_iter().map(|x| x.to_vec()).collect_vec();
 
             tokio::task::spawn_blocking(move || {
                 for head in 0..info.num_head {
@@ -614,11 +619,11 @@ async fn inspect(
                     let end = start + size;
 
                     for source in 0..num_token {
-                        let mut k = data[layer].k[source][start..end].to_vec();
+                        let mut k = k[source][start..end].to_vec();
 
                         for token in source + 1..num_token {
-                            let w = &data[layer].w[token][start..end];
-                            let r = &data[layer].r[token][start..end];
+                            let w = &w[token][start..end];
+                            let r = &r[token][start..end];
 
                             let dot: f32 = k.iter().zip_eq(r).map(|(k, r)| k * r).sum();
                             for (k, w) in k.iter_mut().zip_eq(w) {
