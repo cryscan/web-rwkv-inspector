@@ -17,7 +17,7 @@ Red ones have a positive score; green ones have a negative score.
 
 In this picture, we can see that the head `L5 H10` has some kind of *retrieval behavior*: note that the selected token ("based") is part of a summary of the above text, and this head attends to the selected token to its follower ("ambient") in the source text, which indicated that this head is looking for possible next-word in the given text above.
 
-Also there is another visualization mode, namely `WK` norm, which is essentially a head's attention field for a certain token:
+Also there is another visualization mode, namely `WK` norm, which is essentially a head's influence span for a certain token:
 
 ![wk](assets/screenshots/wk.png).
 
