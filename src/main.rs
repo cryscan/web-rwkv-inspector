@@ -18,7 +18,7 @@ use web_rwkv::{
     context::{Context, ContextBuilder, Instance},
     num::{CoHom, Float},
     runtime::{
-        infer::{InferInput, InferInputBatch, InferOption, InferOutput},
+        infer::{InferInput, InferInputBatch, InferOption, InferOutput, InferOutputBatch},
         loader::Loader,
         model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
         v6, JobRuntime, Submission,
@@ -30,6 +30,7 @@ use web_rwkv::{
 
 const MAX_INPUT_TOKENS: usize = 4096;
 const TOKEN_CHUNK_SIZE: usize = 128;
+const PREDICT_TOP_K: usize = 16;
 
 #[derive(Debug, Clone)]
 struct Runtime {
@@ -58,8 +59,10 @@ struct HookDataCpu {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pack {
     info: ModelInfo,
+    tokens: Vec<u16>,
     decoded: Vec<String>,
     data: Vec<HookDataCpu>,
+    predicts: Vec<[(u16, String, f32); PREDICT_TOP_K]>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -366,14 +369,16 @@ async fn run(ui: Ui) -> Result<()> {
             .map(|x| String::from_utf8_lossy(&x).to_string())
             .collect_vec();
 
-        let mut inference = Some(InferInput::new(
-            vec![InferInputBatch {
-                tokens,
-                option: InferOption::Full,
-            }],
-            128,
-        ));
+        let mut inference = {
+            let tokens = tokens.clone();
+            let option = InferOption::Full;
+            Some(InferInput::new(
+                vec![InferInputBatch { tokens, option }],
+                TOKEN_CHUNK_SIZE,
+            ))
+        };
 
+        let mut predicts = vec![];
         let mut data = vec![HookDataCpu::default(); runtime.model.info.num_layer];
         'prefill: loop {
             let input = inference.take().unwrap();
@@ -395,8 +400,30 @@ async fn run(ui: Ui) -> Result<()> {
                     .collect()
             }
 
-            let _batch = batches.into_iter().next().unwrap();
+            let InferOutputBatch(batch) = batches.into_iter().next().unwrap();
             let num_token = pre_num_token - post_num_token;
+
+            let batch = {
+                let context = &runtime.model.context;
+                web_rwkv::runtime::softmax::softmax_one(context, batch).await?
+            };
+
+            for x in split(batch).into_iter() {
+                let x = x.to_vec();
+                let x = x
+                    .into_iter()
+                    .enumerate()
+                    .sorted_by(|x, y| x.1.total_cmp(&y.1).reverse())
+                    .take(PREDICT_TOP_K)
+                    .map(|(token, prob)| {
+                        let token = token as u16;
+                        let decoded = runtime.tokenizer.decode(&[token]).expect("decode token");
+                        let decoded = String::from_utf8_lossy(&decoded).to_string();
+                        (token, decoded, prob)
+                    })
+                    .collect_vec();
+                predicts.push(x.try_into().expect("vec to array"));
+            }
 
             for (cpu, gpu) in data.iter_mut().zip_eq(runtime.data.iter()) {
                 let mut k = split(gpu.k.back().await);
@@ -426,8 +453,10 @@ async fn run(ui: Ui) -> Result<()> {
         let info = runtime.model.info.clone();
         let pack = Pack {
             info,
+            tokens,
             decoded,
             data,
+            predicts,
         };
 
         inspect(ui.clone(), pack.clone()).await?;
@@ -590,8 +619,10 @@ async fn inspect(
     ui: Ui,
     Pack {
         info,
+        tokens,
         decoded,
         data,
+        predicts,
     }: Pack,
 ) -> Result<()> {
     let ui_id = uid::Id::<UiId>::new();
@@ -660,7 +691,7 @@ async fn inspect(
                 });
 
                 let progress = *processed_rx.borrow() as f32 / total_rk as f32;
-                ui.add(ProgressBar::new(progress));
+                ui.add(ProgressBar::new(progress).text(format!("{:.0}%", progress * 100.0)));
             });
         });
 
@@ -688,7 +719,9 @@ async fn inspect(
 
     let (tx, rx) = flume::unbounded();
     let _inspect_ui = ui.create(move |ctx, _| {
-        use egui::{Color32, Id, Label, RichText, ScrollArea, Sense, Slider, Window};
+        use egui::{
+            Color32, Grid, Id, Label, ProgressBar, RichText, ScrollArea, Sense, Slider, Window,
+        };
 
         Window::new("Inspector").id(Id::new(ui_id)).show(ctx, |ui| {
             let mut mode = mode.lock().unwrap();
@@ -698,8 +731,8 @@ async fn inspect(
             let mut head = head.lock().unwrap();
 
             ui.horizontal(|ui| {
-                ui.radio_value(&mut *mode, Mode::Rwk, "R-Exp(W)-K dot");
-                ui.radio_value(&mut *mode, Mode::Wk, "Exp(W)-K norm");
+                ui.radio_value(&mut *mode, Mode::Rwk, "R-W-K dot");
+                ui.radio_value(&mut *mode, Mode::Wk, "W-K norm");
             });
             ui.add(Slider::new(&mut *scale, -3..=0).text("Scale"));
             ui.add(Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
@@ -709,7 +742,7 @@ async fn inspect(
 
             ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for (index, word) in decoded.iter().enumerate() {
+                    for (index, decoded) in decoded.iter().enumerate() {
                         let text = match index.cmp(&source) {
                             Ordering::Less => {
                                 let layer = *layer;
@@ -735,14 +768,14 @@ async fn inspect(
                                     } else {
                                         Color32::LIGHT_GREEN.gamma_multiply(-v)
                                     };
-                                    RichText::new(word).color(color)
+                                    RichText::new(decoded).color(color)
                                 } else {
-                                    RichText::new(word)
+                                    RichText::new(decoded)
                                 }
                             }
                             Ordering::Equal => {
                                 let color = Color32::LIGHT_BLUE;
-                                RichText::new(word).color(color)
+                                RichText::new(decoded).color(color)
                             }
                             Ordering::Greater => {
                                 let layer = *layer;
@@ -768,16 +801,46 @@ async fn inspect(
                                     } else {
                                         Color32::LIGHT_GREEN.gamma_multiply(-v)
                                     };
-                                    RichText::new(word).color(color)
+                                    RichText::new(decoded).color(color)
                                 } else {
-                                    RichText::new(word)
+                                    RichText::new(decoded)
                                 }
                             }
                         };
                         let label = Label::new(text).sense(Sense::click());
-                        if ui.add(label).clicked() {
+                        let response = ui.add(label);
+                        if response.clicked() {
                             *source = index;
                         }
+                        response.on_hover_ui(|ui| {
+                            Grid::new("token").striped(true).show(ui, |ui| {
+                                let selected = tokens.get(index + 1).unwrap_or(&0);
+
+                                ui.strong("Rank");
+                                ui.strong("Token");
+                                ui.strong("Text");
+                                ui.strong("Probability");
+                                ui.end_row();
+
+                                for (rank, (token, decoded, prob)) in
+                                    predicts[index].iter().enumerate()
+                                {
+                                    let decoded = decoded.replace('\n', "↩");
+                                    if *token == *selected {
+                                        let color = Color32::LIGHT_BLUE;
+                                        ui.colored_label(color, rank.to_string());
+                                        ui.colored_label(color, token.to_string());
+                                        ui.colored_label(color, decoded);
+                                    } else {
+                                        ui.label(rank.to_string());
+                                        ui.label(token.to_string());
+                                        ui.label(decoded);
+                                    }
+                                    ui.add(ProgressBar::new(*prob).text(format!("{:.4}", prob)));
+                                    ui.end_row();
+                                }
+                            });
+                        });
                     }
                 });
             });
