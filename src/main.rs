@@ -596,9 +596,10 @@ async fn inspect(
 ) -> Result<()> {
     let ui_id = uid::Id::<UiId>::new();
 
-    let rk = {
+    let (rwk, wk) = {
         let num_token = decoded.len();
-        let mut rk = HashMap::new();
+        let mut rwk = HashMap::new();
+        let mut wk = HashMap::new();
 
         let size = info.num_emb / info.num_head;
         let (tx, rx) = flume::unbounded();
@@ -622,6 +623,13 @@ async fn inspect(
                         let mut k = k[source][start..end].to_vec();
 
                         for token in source + 1..num_token {
+                            let key = HeadKey {
+                                layer,
+                                head,
+                                source,
+                                token,
+                            };
+
                             let w = &w[token][start..end];
                             let r = &r[token][start..end];
 
@@ -630,14 +638,9 @@ async fn inspect(
                                 *k *= w;
                             }
 
-                            let key = HeadKey {
-                                layer,
-                                head,
-                                source,
-                                token,
-                            };
+                            let norm = k.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-                            let Ok(_) = tx.send((key, dot)) else {
+                            let Ok(_) = tx.send((key, dot, norm)) else {
                                 return;
                             };
                         }
@@ -662,15 +665,22 @@ async fn inspect(
         });
 
         drop(tx);
-        while let Ok((key, value)) = rx.recv_async().await {
-            rk.insert(key, value);
+        while let Ok((key, dot, norm)) = rx.recv_async().await {
+            rwk.insert(key, dot);
+            wk.insert(key, norm);
             processed_tx.send_modify(|count| *count += 1);
         }
-
-        rk
+        (rwk, wk)
     };
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    enum Mode {
+        Rwk,
+        Wk,
+    }
+
     let num_token = decoded.len();
+    let mode = Mutex::new(Mode::Rwk);
     let scale = Mutex::new(0);
     let source = Mutex::new(0usize);
     let layer = Mutex::new(0usize);
@@ -681,11 +691,16 @@ async fn inspect(
         use egui::{Color32, Id, Label, RichText, ScrollArea, Sense, Slider, Window};
 
         Window::new("Inspector").id(Id::new(ui_id)).show(ctx, |ui| {
+            let mut mode = mode.lock().unwrap();
             let mut scale = scale.lock().unwrap();
             let mut source = source.lock().unwrap();
             let mut layer = layer.lock().unwrap();
             let mut head = head.lock().unwrap();
 
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut *mode, Mode::Rwk, "R-Exp(W)-K dot");
+                ui.radio_value(&mut *mode, Mode::Wk, "Exp(W)-K norm");
+            });
             ui.add(Slider::new(&mut *scale, -3..=0).text("Scale"));
             ui.add(Slider::new(&mut *source, 0..=num_token - 1).text("Source Token"));
             ui.add(Slider::new(&mut *layer, 0..=info.num_layer - 1).text("Layer"));
@@ -701,6 +716,7 @@ async fn inspect(
                                 let head = *head;
                                 let token = *source;
                                 let source = index;
+                                let mode = *mode;
                                 let scale = 10.0_f32.powi(*scale);
 
                                 let key = HeadKey {
@@ -709,12 +725,15 @@ async fn inspect(
                                     source,
                                     token,
                                 };
-                                if let Some(rk) = rk.get(&key) {
-                                    let rk = (rk * scale).clamp(-1.0, 1.0);
-                                    let color = if rk >= 0.0 {
-                                        Color32::LIGHT_RED.gamma_multiply(rk)
+                                if let Some(v) = match mode {
+                                    Mode::Rwk => rwk.get(&key),
+                                    Mode::Wk => wk.get(&key),
+                                } {
+                                    let v = (v * scale).clamp(-1.0, 1.0);
+                                    let color = if v >= 0.0 {
+                                        Color32::LIGHT_RED.gamma_multiply(v)
                                     } else {
-                                        Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                        Color32::LIGHT_GREEN.gamma_multiply(-v)
                                     };
                                     RichText::new(word).color(color)
                                 } else {
@@ -730,6 +749,7 @@ async fn inspect(
                                 let head = *head;
                                 let source = *source;
                                 let token = index;
+                                let mode = *mode;
                                 let scale = 10.0_f32.powi(*scale);
 
                                 let key = HeadKey {
@@ -738,12 +758,15 @@ async fn inspect(
                                     source,
                                     token,
                                 };
-                                if let Some(rk) = rk.get(&key) {
-                                    let rk = (rk * scale).clamp(-1.0, 1.0);
-                                    let color = if rk >= 0.0 {
-                                        Color32::LIGHT_RED.gamma_multiply(rk)
+                                if let Some(v) = match mode {
+                                    Mode::Rwk => rwk.get(&key),
+                                    Mode::Wk => wk.get(&key),
+                                } {
+                                    let v = (v * scale).clamp(-1.0, 1.0);
+                                    let color = if v >= 0.0 {
+                                        Color32::LIGHT_RED.gamma_multiply(v)
                                     } else {
-                                        Color32::LIGHT_GREEN.gamma_multiply(-rk)
+                                        Color32::LIGHT_GREEN.gamma_multiply(-v)
                                     };
                                     RichText::new(word).color(color)
                                 } else {
