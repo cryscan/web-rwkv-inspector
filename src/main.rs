@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncReadExt, BufReader},
 };
 use web_rwkv::{
-    context::{Context, ContextBuilder, Instance},
+    context::{Context, ContextBuilder, InstanceExt},
     num::{CoHom, Float},
     runtime::{
         infer::{InferInput, InferInputBatch, InferOption, InferOutput, InferOutputBatch},
@@ -74,7 +74,7 @@ struct HeadKey {
 }
 
 async fn create_context(info: &ModelInfo) -> Result<Context> {
-    let instance = Instance::new();
+    let instance = web_rwkv::wgpu::Instance::default();
     let adapter = instance
         .adapter(wgpu::PowerPreference::HighPerformance)
         .await?;
@@ -150,7 +150,7 @@ async fn load_runtime(
         );
     }
 
-    let builder = v6::ModelJobBuilder::new_with_hooks(model.clone(), 1, hooks);
+    let builder = v6::ModelRuntime::new_with_hooks(model.clone(), 1, hooks);
     let runtime = JobRuntime::new(builder).await;
 
     Ok(Runtime {

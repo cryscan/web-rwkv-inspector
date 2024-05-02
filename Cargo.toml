@@ -14,7 +14,7 @@ eframe = "0.27.2"
 egui = { version = "0.27.2", features = ["default", "serde"] }
 flume = "0.11"
 half = { version = "2.2", features = ["bytemuck", "serde"] }
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 itertools = "0.12"
 log = "0.4"
 memmap2 = "0.9"
@@ -22,10 +22,10 @@ rayon = "1.10.0"
 rfd = "0.14"
 safetensors = "0.4"
 serde = { version = "1.0", features = ["derive", "rc"] }
-simple_logger = { version = "4.2", features = ["stderr"] }
+simple_logger = { version = "5.0.0", features = ["stderr"] }
 tokio = { version = "1.37", features = ["full"] }
 uid = "0.1.7"
 
 [dependencies.web-rwkv]
 # path = "../web-rwkv"
-version = "0.7.6"
+version = "0.8.0"
