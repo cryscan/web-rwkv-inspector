@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -35,7 +36,7 @@ const PREDICT_TOP_K: usize = 16;
 #[derive(Debug, Clone)]
 struct Runtime {
     tokenizer: Arc<Tokenizer>,
-    runtime: JobRuntime<InferInput, InferOutput<f16>>,
+    runtime: JobRuntime<InferInput, InferOutput>,
     model: v6::Model,
     data: Vec<HookDataGpu>,
 }
@@ -95,9 +96,14 @@ async fn load_tokenizer() -> Result<Tokenizer> {
 
 async fn load_runtime(
     context: &Context,
+    info: &ModelInfo,
     data: &[u8],
     quant: HashMap<usize, Quant>,
 ) -> Result<Runtime> {
+    if !matches!(info.version, ModelVersion::V6) {
+        bail!("only supports v6 models")
+    }
+
     let tokenizer = Arc::new(load_tokenizer().await?);
 
     let model = SafeTensors::deserialize(data)?;
@@ -258,10 +264,6 @@ async fn run(ui: Ui) -> Result<()> {
         let info = Loader::info(&model)?;
         log::info!("{:#?}", info);
 
-        if !matches!(info.version, ModelVersion::V6) {
-            bail!("only supports V6 models");
-        }
-
         let quant = {
             let (tx, rx) = flume::unbounded();
             let quant = Mutex::new(0usize);
@@ -301,7 +303,7 @@ async fn run(ui: Ui) -> Result<()> {
         let context = create_context(&info).await?;
         log::info!("{:#?}", context.adapter.get_info());
 
-        match load_runtime(&context, &data, quant).await {
+        match load_runtime(&context, &info, &data, quant).await {
             Ok(runtime) => break 'load runtime,
             Err(err) => {
                 drop(ui_load);
@@ -462,11 +464,16 @@ async fn run(ui: Ui) -> Result<()> {
             predicts,
         };
 
-        inspect(ui.clone(), pack.clone()).await?;
+        'save: loop {
+            #[derive(Debug, Clone, Serialize, Deserialize)]
+            enum SaveOption {
+                Save(PathBuf),
+                Continue,
+                Back,
+            }
 
-        let path = {
             let (tx, rx) = flume::unbounded();
-            let _ui_load = ui.create(move |ctx, _| {
+            let _ui_save = ui.create(move |ctx, _| {
                 egui::Window::new("Save").title_bar(false).show(ctx, |ui| {
                     ui.label("Save the trace?");
                     ui.separator();
@@ -476,52 +483,60 @@ async fn run(ui: Ui) -> Result<()> {
                                 .add_filter("Trace", &["tr"])
                                 .save_file()
                             {
-                                let _ = tx.send(Some(path));
+                                let _ = tx.send(SaveOption::Save(path));
                             }
                         }
+                        if ui.button("Continue").clicked() {
+                            let _ = tx.send(SaveOption::Continue);
+                        }
                         if ui.button("Back").clicked() {
-                            let _ = tx.send(None);
+                            let _ = tx.send(SaveOption::Back);
                         }
                     });
                 });
             });
-            match rx.recv_async().await? {
-                Some(path) => path,
-                None => continue 'input,
-            }
-        };
 
-        let (tx, rx) = flume::unbounded();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use std::{fs::File, io::Write};
+            let path = match rx.recv_async().await? {
+                SaveOption::Save(path) => path,
+                SaveOption::Continue => break 'save,
+                SaveOption::Back => continue 'input,
+            };
 
-            struct FileWriter(File);
-            impl cbor4ii::core::enc::Write for FileWriter {
-                type Error = std::io::Error;
+            let pack = pack.clone();
+            let (tx, rx) = flume::unbounded();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::{fs::File, io::Write};
 
-                fn push(&mut self, input: &[u8]) -> Result<(), Self::Error> {
-                    self.0.write_all(input)
+                struct FileWriter(File);
+                impl cbor4ii::core::enc::Write for FileWriter {
+                    type Error = std::io::Error;
+
+                    fn push(&mut self, input: &[u8]) -> Result<(), Self::Error> {
+                        self.0.write_all(input)
+                    }
                 }
-            }
 
-            let file = FileWriter(File::create(path)?);
-            let mut serializer = cbor4ii::serde::Serializer::new(file);
+                let file = FileWriter(File::create(path)?);
+                let mut serializer = cbor4ii::serde::Serializer::new(file);
 
-            pack.serialize(&mut serializer)?;
-            let _ = tx.send(());
-            Ok(())
-        });
+                pack.serialize(&mut serializer)?;
+                let _ = tx.send(());
+                Ok(())
+            });
 
-        let _save_ui = ui.create(|ctx, _| {
-            egui::Window::new("Save").title_bar(false).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Saving trace file...");
-                    ui.spinner();
+            let _save_ui = ui.create(|ctx, _| {
+                egui::Window::new("Save").title_bar(false).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Saving trace file...");
+                        ui.spinner();
+                    });
                 });
             });
-        });
 
-        rx.recv_async().await?;
+            rx.recv_async().await?;
+        }
+
+        inspect(ui.clone(), pack).await?;
     }
 }
 
