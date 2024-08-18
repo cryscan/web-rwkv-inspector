@@ -2,6 +2,10 @@
 
 This is an inspector for the language model of [RWKV X060](https://github.com/BlinkDL/RWKV-LM). It lets you look into the inner state of the model during inference.
 
+## Download
+
+Download pre-built binaries at [Release](https://github.com/cryscan/web-rwkv-inspector/releases).
+
 ## Introduction
 
 ![3b](assets/screenshots/3b.png)
