@@ -22,7 +22,7 @@ use web_rwkv::{
         infer::{InferInput, InferInputBatch, InferOption, InferOutput, InferOutputBatch},
         loader::Loader,
         model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
-        v6, JobRuntime, Submission,
+        v6, JobRuntime,
     },
     tensor::{kind::ReadWrite, ops::TensorOp, TensorCpu, TensorGpu, TensorShape},
     tokenizer::Tokenizer,
@@ -389,11 +389,7 @@ async fn run(ui: Ui) -> Result<()> {
             let input = inference.take().unwrap();
             let pre_num_token = input.batches[0].tokens.len();
 
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            let submission = Submission { input, sender };
-            let _ = runtime.runtime.send(submission).await;
-
-            let (input, InferOutput(batches)) = receiver.await?;
+            let (input, InferOutput(batches)) = runtime.runtime.infer(input).await;
             let post_num_token = input.batches[0].tokens.len();
             inference = Some(input);
 
@@ -920,5 +916,5 @@ async fn main() {
         default_theme: eframe::Theme::Dark,
         ..Default::default()
     };
-    eframe::run_native("Web-RWKV Inspector", options, Box::new(|_| app)).unwrap();
+    eframe::run_native("Web-RWKV Inspector", options, Box::new(|_| Ok(app))).unwrap();
 }
