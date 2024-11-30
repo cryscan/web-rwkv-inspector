@@ -21,8 +21,8 @@ use web_rwkv::{
     runtime::{
         infer::{InferInput, InferInputBatch, InferOption, InferOutput, InferOutputBatch},
         loader::Loader,
-        model::{Build, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
-        v6, JobRuntime,
+        model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant},
+        v6, TokioRuntime,
     },
     tensor::{kind::ReadWrite, ops::TensorOp, TensorCpu, TensorGpu, TensorShape},
     tokenizer::Tokenizer,
@@ -36,7 +36,7 @@ const PREDICT_TOP_K: usize = 16;
 #[derive(Debug, Clone)]
 struct Runtime {
     tokenizer: Arc<Tokenizer>,
-    runtime: JobRuntime<InferInput, InferOutput>,
+    runtime: TokioRuntime<InferInput, InferOutput>,
     model: v6::Model,
     data: Vec<HookDataGpu>,
 }
@@ -107,8 +107,10 @@ async fn load_runtime(
     let tokenizer = Arc::new(load_tokenizer().await?);
 
     let model = SafeTensors::deserialize(data)?;
-    let builder = ModelBuilder::new(context, model).quant(quant);
-    let model = Build::<v6::Model>::build(builder).await?;
+    let model = ModelBuilder::new(context, model)
+        .quant(quant)
+        .build_v6()
+        .await?;
 
     let data = (0..model.info.num_layer)
         .map(|_| {
@@ -156,8 +158,8 @@ async fn load_runtime(
         );
     }
 
-    let builder = v6::ModelRuntime::new_with_hooks(model.clone(), 1, hooks);
-    let runtime = JobRuntime::new(builder).await;
+    let bundle = v6::Bundle::new_with_hooks(model.clone(), 1, hooks);
+    let runtime = TokioRuntime::new(bundle).await;
 
     Ok(Runtime {
         tokenizer,
@@ -389,7 +391,7 @@ async fn run(ui: Ui) -> Result<()> {
             let input = inference.take().unwrap();
             let pre_num_token = input.batches[0].tokens.len();
 
-            let (input, InferOutput(batches)) = runtime.runtime.infer(input).await;
+            let (input, InferOutput(batches)) = runtime.runtime.infer(input).await?;
             let post_num_token = input.batches[0].tokens.len();
             inference = Some(input);
 
@@ -912,9 +914,15 @@ async fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_drag_and_drop(true),
-        follow_system_theme: false,
-        default_theme: eframe::Theme::Dark,
         ..Default::default()
     };
-    eframe::run_native("Web-RWKV Inspector", options, Box::new(|_| Ok(app))).unwrap();
+    eframe::run_native(
+        "Web-RWKV Inspector",
+        options,
+        Box::new(|creation_context| {
+            creation_context.egui_ctx.set_theme(egui::Theme::Dark);
+            Ok(app)
+        }),
+    )
+    .unwrap();
 }
