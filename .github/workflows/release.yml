@@ -14,8 +14,8 @@ env:
   LINUX_TARGET: x86_64-unknown-linux-gnu
 
   # Space separated paths to include in the archive.
+  RELEASE_ADDS: README.md LICENSE assets
   RELEASE_BINS: web-rwkv-inspector
-  RELEASE_ADDS: assets README.md
 
 jobs:
   build:
@@ -23,30 +23,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        build: [windows]
+        build: [linux, macos, windows]
         include:
           - build: linux
             os: ubuntu-latest
             rust: stable
-          # - build: macos
-          #   os: macos-latest
-          #   rust: stable
+          - build: macos
+            os: macos-latest
+            rust: stable
           - build: windows
             os: windows-latest
             rust: stable
 
     steps:
       - uses: actions/checkout@v2
-        with:
-          lfs: true
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
           override: true
           target: wasm32-unknown-unknown
 
-      - name: Checkout LFS objects
-        run: git lfs checkout
       - name: Query version number
         id: get_version
         shell: bash
@@ -59,7 +55,6 @@ jobs:
           sudo apt-get update -y --allow-releaseinfo-change
           sudo apt-get install libudev-dev
           sudo apt-get install libasound2-dev
-          sudo apt-get install libgtk-3-dev
       - name: Install p7zip (MacOS)
         if: matrix.build == 'macos'
         run: brew install p7zip
@@ -68,14 +63,15 @@ jobs:
         if: matrix.build == 'linux'
         run: |
           rustup target add ${{ env.LINUX_TARGET }}
-          cargo build --release --target ${{ env.LINUX_TARGET }}
+          cargo build --release --examples --target ${{ env.LINUX_TARGET }} --all-features
       - name: Build (MacOS)
         if: matrix.build == 'macos'
-        run: cargo build --release
-
+        run: |
+          cargo build --release --examples --all-features
       - name: Build (Windows)
         if: matrix.build == 'windows'
-        run: cargo build --release
+        run: |
+          cargo build --release --examples --all-features
 
       - name: Create artifact directory
         run: |
@@ -110,7 +106,7 @@ jobs:
           mv ${{ env.RELEASE_ADDS }} ./dist
           7z a -tzip ./${{ env.RELEASE_DIR }}/${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.MACOS_TARGET }}.zip ./dist
       - name: Upload Zip
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.build }}
           path: ./${{ env.RELEASE_DIR }}
@@ -137,19 +133,19 @@ jobs:
           release_name: ${{ steps.get_version.outputs.VERSION }}
 
       - name: Download Linux tarball
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
           name: linux
 
-      - name: Download Windows tarball
-        uses: actions/download-artifact@v1
+      - name: Download MacOS tarball
+        uses: actions/download-artifact@v4
         with:
           name: windows
 
-      # - name: Download MacOS tarball
-      #   uses: actions/download-artifact@v1
-      #   with:
-      #     name: macos
+      - name: Download MacOS tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: macos
 
       - name: Release Linux tarball
         uses: actions/upload-release-asset@v1
@@ -157,7 +153,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./linux/${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.LINUX_TARGET }}.zip
+          asset_path: ./${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.LINUX_TARGET }}.zip
           asset_content_type: application/zip
           asset_name: ${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.LINUX_TARGET }}.zip
 
@@ -167,16 +163,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./windows/${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.WINDOWS_TARGET }}.zip
+          asset_path: ./${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.WINDOWS_TARGET }}.zip
           asset_content_type: application/zip
           asset_name: ${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.WINDOWS_TARGET }}.zip
-
-      # - name: Release MacOS tarball
-      #   uses: actions/upload-release-asset@v1
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   with:
-      #     upload_url: ${{ steps.create_release.outputs.upload_url }}
-      #     asset_path: ./macos/${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.MACOS_TARGET }}.zip
-      #     asset_content_type: application/zip
-      #     asset_name: ${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.MACOS_TARGET }}.zip
+      - name: Release MacOS tarball
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.MACOS_TARGET }}.zip
+          asset_content_type: application/zip
+          asset_name: ${{ env.RELEASE_BIN }}-${{ steps.get_version.outputs.VERSION }}-${{ env.MACOS_TARGET }}.zip
