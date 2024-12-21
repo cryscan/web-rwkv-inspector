@@ -882,7 +882,7 @@ async fn load_fonts(ui: Ui) -> Result<()> {
         let mut fonts = egui::FontDefinitions::default();
         fonts
             .font_data
-            .insert("noto_sans".into(), egui::FontData::from_owned(data));
+            .insert("noto_sans".into(), egui::FontData::from_owned(data).into());
         fonts
             .families
             .get_mut(&egui::FontFamily::Proportional)

@@ -7,11 +7,11 @@ version = "0.1.8"
 
 [dependencies]
 anyhow = "1.0"
-bytemuck = { version = "1.13", features = ["extern_crate_alloc"] }
+bytemuck = { version = "1.21", features = ["extern_crate_alloc"] }
 cbor4ii = { version = "0.3.2", features = ["serde1"] }
-clap = { version = "4.3", features = ["derive"] }
-eframe = "0.29"
-egui = { version = "0.29", features = ["default", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+eframe = "0.30"
+egui = { version = "0.30", features = ["default", "serde"] }
 flume = "0.11"
 half = { version = "2.2", features = ["bytemuck", "serde"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -28,4 +28,4 @@ uid = "0.1.7"
 
 [dependencies.web-rwkv]
 # path = "../web-rwkv"
-version = "0.9.0"
+version = "0.10.3"
